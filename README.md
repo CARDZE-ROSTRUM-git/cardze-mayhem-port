@@ -8,6 +8,12 @@
 A desktop port of the **PortaPack Mayhem** firmware (HackRF One + PortaPack H2)
 that runs natively on Linux as an SDL2 application.
 
+## Tested on
+
+* Tested **only** under the **niri** window manager (Wayland). Other desktops and
+  compositors have not been exercised.
+* Designed for and tested on **cyberdecks** with a **7-inch 1024x600** display.
+
 The original Mayhem UI is used **unmodified**: menus, widgets, fonts, icons and
 the 240x320 layout are the real firmware code. Only the low layers are replaced:
 
