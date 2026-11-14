@@ -1,5 +1,8 @@
 # cardze-mayhem-port
 
+> **ALPHA** — early, work-in-progress port. Expect rough edges and unfinished
+> features.
+
 A desktop port of the **PortaPack Mayhem** firmware (HackRF One + PortaPack H2)
 that runs natively on Linux as an SDL2 application.
 
@@ -13,82 +16,98 @@ the 240x320 layout are the real firmware code. Only the low layers are replaced:
 | ILI9341 LCD over SPI       | RGB565 framebuffer + SDL2 textures                |
 | Physical buttons/encoder   | keyboard + on-screen PortaPack H2 body            |
 | FatFs SD card              | a plain directory (`mayhem-sd/`)                   |
-| Baseband samples           | host SDR backend (RTL-SDR / PlutoSDR) + file stub  |
+| RTL-SDR / PlutoSDR         | libiio (`libiio`) and `librtlsdr` backends        |
 
 All **102 upstream external apps** (RX / TX / Games / Utilities / Settings /
-Debug tabs) are compiled straight into the host binary, so the full Mayhem app
-list works on the desktop.
+Debug tabs) are compiled into the host binary.
+
+## ⚠️ SDR support — read this first
+
+**Only two SDR backends are supported:**
+
+* **PlutoSDR** (via `libiio`) — full RX **and TX**
+* **RTL-SDR** (via `librtlsdr`) — **RX only**
+
+There is no HackRF / PortaPack USB support: this is a *port*, not an emulator,
+so the original HackRF hardware is not used.
+
+## ⚠️ TX is unfinished (ALPHA)
+
+TX support is **experimental and unverified on air**. The main developer **does
+not own a PlutoSDR yet**, so TX has only been exercised against the SDR backends
+in code — **not confirmed on real hardware**. Treat every TX feature as
+untested. RX is the tested path.
 
 ## Features
 
 * Real Mayhem firmware UI, scaled x1 / x2 / x3, framed as a PortaPack H2 body.
-* Keyboard works as an alternative to the on-screen buttons; mouse = touchscreen.
-* Optional SDR backends: RTL-SDR and PlutoSDR, selected at build time.
-* File-based TX replay when no transmit-capable SDR is present.
-* Floating window by default, with `F` / `F11` toggle to borderless fullscreen
+* Keyboard as an alternative to the on-screen buttons; mouse = touchscreen.
+* File-based TX stub when no transmit-capable SDR is present.
+* Floating window by default; `F` / `F11` toggles borderless fullscreen
   (body keeps its aspect ratio, letterboxed and centered).
 * Emulated SD card is a folder, so settings, captures and playlists travel with
   the app.
 
-## Requirements
-
-* Linux, C++20 compiler (GCC or Clang), CMake >= 3.16
-* SDL2 (`libsdl2-dev`)
-* Optional: `librtlsdr` for RTL-SDR, `libiio` for PlutoSDR
-* The upstream Mayhem firmware source tree (see below)
-
-### Install build dependencies (examples)
+## Install from scratch (Arch / EndeavourOS)
 
 ```sh
-# Arch / EndeavourOS
-sudo pacman -S base-devel cmake sdl2 rtl-sdr libiio
+# 1. Build dependencies + SDR libraries
+sudo pacman -S --needed base-devel cmake git pkgconf sdl2 sdl2_image \
+    rtl-sdr libiio libad9361-iio python
 
-# Debian / Ubuntu
-sudo apt install build-essential cmake libsdl2-dev librtlsdr-dev libiio-dev
-```
+# 2. Get this port
+git clone https://github.com/CARDZE-ROSTRUM-git/cardze-mayhem-port.git
+cd cardze-mayhem-port
 
-## Get the upstream firmware
-
-This repository contains **only the port's own code** (the `platform/` layer,
-`cmake/` helpers and tooling). The upstream firmware is **not** vendored here.
-Clone it into `third_party/mayhem-firmware` at the pinned commit:
-
-```sh
+# 3. Get the upstream firmware at the pinned commit
 git clone https://github.com/portapack-mayhem/mayhem-firmware.git \
     third_party/mayhem-firmware
 git -C third_party/mayhem-firmware checkout 77798cb09f227de5c58dea48899ddb7448b44a07
-```
 
-The port is developed against upstream commit `77798cb0`
-(2026-11-07). Upstream is never patched; all host adaptation lives in
-`platform/` and `cmake/`, applied through forced-includes and include shadowing.
-
-## Build
-
-```sh
+# 4. Build
 mkdir -p build && cd build
 cmake ..
 cmake --build . -j"$(nproc)"
+
+# 5. Run
+cd .. && cp -f build/mayhem-desktop . && ./run.sh
 ```
 
-The result is the `mayhem-desktop` binary. Copy it next to `run.sh` and the
-`mayhem-sd/` folder (or just run it from the build directory with `MAYHEM_SD`
-pointing at an SD folder).
+### Debian / Ubuntu equivalent
 
-The RTL-SDR / PlutoSDR backends are compiled **only when the matching library is
-found**; without them the app still builds and runs with the file TX stub.
+```sh
+sudo apt install build-essential cmake git pkg-config libsdl2-dev sdl2-image \
+    librtlsdr-dev libiio-dev libad9361-dev python3
+```
+
+Then repeat steps 2–5 above.
+
+## Packages / requirements
+
+| Package        | Needed for                     |
+|----------------|--------------------------------|
+| `cmake`, `git`, `pkgconf` | build system          |
+| `base-devel` / `build-essential` | C/C++ toolchain  |
+| `sdl2`         | window, input, audio           |
+| `sdl2_image`   | image loading (icons/screens)  |
+| `rtl-sdr`      | RTL-SDR backend (RX only)      |
+| `libiio`       | PlutoSDR backend (RX + TX)     |
+| `libad9361-iio`| PlutoSDR RF helpers            |
+| `python`       | `tools/gen_external.py`        |
+
+The RTL-SDR / PlutoSDR backends are compiled **only when their library is
+found**. Without them the app still builds and runs with the file TX stub.
 
 ## Run
 
-`run.sh` is a small launcher that sits next to the binary and its emulated SD
-card:
+`run.sh` sits next to the binary and its emulated SD card:
 
 ```sh
 ./run.sh
 ```
 
 It sets `MAYHEM_SD` to the sibling `mayhem-sd/` folder and picks a sensible SDL
-video driver for the current session. You can override the SD location:
+video driver. Override the SD location if you want:
 
 ```sh
 MAYHEM_SD=~/my-mayhem-sd ./run.sh
@@ -115,21 +134,17 @@ cmake/              Generated upstream + external-app source lists
 tools/              gen_external.py (regenerates the external app tables)
 CMakeLists.txt      Host build (SDL2, optional RTL-SDR / PlutoSDR)
 run.sh              Launcher for the built binary + emulated SD card
-HANDOFF.md          Detailed development notes (Russian)
+HANDOFF.md          Development notes (Russian)
 ```
 
-## Status / notes
+## Notes
 
-* Upstream files are **never modified**; the GPL headers are preserved verbatim.
+* Upstream files are **never modified**; GPL headers are preserved verbatim.
   New host files are marked as part of this GPL derivative work.
-* `HANDOFF.md` (in Russian) documents the porting details, known traps and what
-  has been verified live on real hardware (RTL-SDR v2 / no TX-capable device
-  available for on-air tests).
-* Not every statistics message from the baseband side is wired up yet; see
-  `HANDOFF.md` for the current gaps.
+* Not every baseband statistics message is wired up yet — see `HANDOFF.md`.
 
 ## License
 
-This port is a derivative work of the GPL-licensed PortaPack Mayhem firmware
-(see upstream `LICENSE` and `LICENSE.GPL-2.0-or-later`). It is distributed under
-the same terms. All upstream copyright and license notices are retained.
+Derivative work of the GPL-licensed PortaPack Mayhem firmware (see upstream
+`LICENSE` and `LICENSE.GPL-2.0-or-later`). Distributed under the same terms; all
+upstream copyright and license notices are retained.
