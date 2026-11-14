@@ -1,5 +1,7 @@
 # cardze-mayhem-port
 
+**English** | [Русский](README.ru.md)
+
 > **ALPHA** — early, work-in-progress port. Expect rough edges and unfinished
 > features.
 
@@ -136,6 +138,16 @@ CMakeLists.txt      Host build (SDL2, optional RTL-SDR / PlutoSDR)
 run.sh              Launcher for the built binary + emulated SD card
 HANDOFF.md          Development notes (Russian)
 ```
+
+## Roadmap
+
+* **Android support** — planned.
+* **Windows support** — planned.
+
+## Known issues
+
+* In **non-system apps** the waterfall renders poorly — it stutters and updates
+  unevenly compared to the built-in system apps.
 
 ## Notes
 
