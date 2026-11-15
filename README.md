@@ -50,6 +50,11 @@ untested. RX is the tested path.
 
 * Real Mayhem firmware UI, scaled x1 / x2 / x3, framed as a PortaPack H2 body.
 * Keyboard as an alternative to the on-screen buttons; mouse = touchscreen.
+* Pre-boot **setup window**: pick the SD folder, the SDR device, the input mode
+  (touchscreen + on-screen buttons, or **touchscreen only**) and the window
+  rotation.
+* The rotation picked in the setup window is **saved** and reused on the next
+  launch.
 * File-based TX stub when no transmit-capable SDR is present.
 * Floating window by default; `F` / `F11` toggles borderless fullscreen
   (body keeps its aspect ratio, letterboxed and centered).
@@ -166,3 +171,7 @@ HANDOFF.md          Development notes (Russian)
 Derivative work of the GPL-licensed PortaPack Mayhem firmware (see upstream
 `LICENSE` and `LICENSE.GPL-2.0-or-later`). Distributed under the same terms; all
 upstream copyright and license notices are retained.
+
+## Author / contact
+
+Maintained by **[@CARDPUTER_ZERO](https://t.me/cardputer_zero)** on Telegram.

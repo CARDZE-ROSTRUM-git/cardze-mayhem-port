@@ -39,6 +39,19 @@ int device_width();
 int device_height();
 int scale();
 
+/* Show or hide the physical control deck (the five-way cross and the rotary
+ * encoder) below the panel. Hidden means "touchscreen only": the body shrinks
+ * so the window is just the screen, keeping the top strip (rotate / FS / DFU)
+ * and the silkscreen band with the owner handle. Visible by default. */
+void set_deck_visible(bool on);
+bool deck_visible();
+
+/* Set the body rotation in degrees (snapped to 0/90/180/270, clockwise) and
+ * resize the floating window to match, exactly as pressing R does. The setup
+ * window uses this to apply a saved default rotation at startup. */
+void set_rotation(int degrees);
+int rotation();
+
 /* Injects a synthetic SDL keyboard/mouse event into this process's own event
  * queue. Used by main.cpp for the splash auto-advance and the MAYHEM_SELFTEST
  * path; it never touches the operator's input devices. */

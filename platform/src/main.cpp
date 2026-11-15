@@ -192,6 +192,13 @@ int main(int argc, char** argv) {
         }
         sd_dir = choice.sd_dir;
         sdr::set_preferred_device(choice.driver, choice.device_args);
+        /* Apply the chosen input mode and rotation: with the deck hidden the
+         * window shrinks to just the screen before the firmware boots. */
+        lcd_sdl::set_deck_visible(!choice.touch_only);
+        lcd_sdl::set_rotation(choice.rotation);
+    } else {
+        /* No setup window this run: honour the rotation saved by the last one. */
+        lcd_sdl::set_rotation(host_launcher::saved_rotation());
     }
 
     /* Install the chosen folder: the FatFs shim and the persistent-memory

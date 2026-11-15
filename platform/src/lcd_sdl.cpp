@@ -93,8 +93,22 @@ constexpr int PANEL_Y = HEADER_H + MARGIN + BEZEL;
 /* Control deck below the panel. */
 constexpr int DECK_Y = PANEL_Y + PANEL_H + BEZEL;
 
+/* Bottom silkscreen band carrying the host handle, below the deck. */
+constexpr int FOOTER_H = 18;
+
 /* Full device extent, top strip included. */
-constexpr int DEVICE_H = DECK_Y + DECK_H + MARGIN;
+constexpr int DEVICE_H = DECK_Y + DECK_H + FOOTER_H;
+
+/* The physical control deck (five-way cross + rotary encoder) below the panel
+ * can be hidden so the window becomes just the screen ("touchscreen only").
+ * When hidden the body is DECK_H shorter; the top strip (rotate / FS / DFU) and
+ * the silkscreen band with the owner handle stay. Toggled from the pre-boot
+ * setup window through set_deck_visible(). */
+bool g_deck_visible = true;
+
+/* Body height for the current deck visibility. Everything that lays out or maps
+ * against the body's bottom edge goes through this instead of DEVICE_H. */
+inline int dev_h() { return g_deck_visible ? DEVICE_H : DEVICE_H - DECK_H; }
 
 /* H2 body palette. */
 constexpr uint32_t COL_SHELL = 0x303030;
@@ -214,10 +228,10 @@ bool g_touch_release = false;
  * height. At 90/270 degrees the whole instrument is turned on its side, so the
  * on-screen width and height swap. */
 inline int window_width_dev() {
-    return (g_rotation == 90 || g_rotation == 270) ? DEVICE_H : DEVICE_W;
+    return (g_rotation == 90 || g_rotation == 270) ? dev_h() : DEVICE_W;
 }
 inline int window_height_dev() {
-    return (g_rotation == 90 || g_rotation == 270) ? DEVICE_W : DEVICE_H;
+    return (g_rotation == 90 || g_rotation == 270) ? DEVICE_W : dev_h();
 }
 
 /* Window size in pixels for the current scale and rotation. */
@@ -239,7 +253,7 @@ void current_window_size(int& w, int& h) {
  * The window is in the *rotated* frame, so under 90/270 the body's X maps to
  * the window's height and vice versa (SDL scales first, then rotates). */
 void current_screen_scale_xy(double& s_w, double& s_h) {
-    int ww = DEVICE_W, wh = DEVICE_H;
+    int ww = DEVICE_W, wh = dev_h();
     if (g_window != nullptr) SDL_GetWindowSize(g_window, &ww, &wh);
     if (ww < 1) ww = 1;
     if (wh < 1) wh = 1;
@@ -247,10 +261,10 @@ void current_screen_scale_xy(double& s_w, double& s_h) {
     const int rot = ((g_rotation % 360) + 360) % 360;
     if (rot == 90 || rot == 270) {
         s_w = static_cast<double>(wh) / DEVICE_W;
-        s_h = static_cast<double>(ww) / DEVICE_H;
+        s_h = static_cast<double>(ww) / dev_h();
     } else {
         s_w = static_cast<double>(ww) / DEVICE_W;
-        s_h = static_cast<double>(wh) / DEVICE_H;
+        s_h = static_cast<double>(wh) / dev_h();
     }
 
     /* In fullscreen the instrument keeps its aspect ratio and sits centred
@@ -340,7 +354,7 @@ void window_to_device(int wx, int wy, int& dx, int& dy) {
 
     /* Convert to device units about the body's centre, per axis. */
     dx = static_cast<int>(u / s_w + DEVICE_W / 2.0);
-    dy = static_cast<int>(v / s_h + DEVICE_H / 2.0);
+    dy = static_cast<int>(v / s_h + dev_h() / 2.0);
 }
 
 /* Rotates a window-space motion delta into the device's own axes, undoing
@@ -433,6 +447,9 @@ const Glyph kGlyphs[] = {
     {'v', {0x08, 0x18, 0x3f, 0x18, 0x08}},
     {'<', {0x08, 0x08, 0x1c, 0x3e, 0x08}},
     {'>', {0x08, 0x3e, 0x1c, 0x08, 0x08}},
+    /* Punctuation used by the owner handle drawn on the deck. */
+    {'_', {0x40, 0x40, 0x40, 0x40, 0x40}},
+    {'@', {0x3e, 0x41, 0x5d, 0x55, 0x1e}},
 };
 
 /* True for the arrow label glyphs, which must be matched verbatim rather than
@@ -510,7 +527,7 @@ void draw_rotate_icon(SDL_Renderer* r, const SDL_Rect& box, uint32_t rgb) {
  * pressed-state visuals are re-drawn on top by draw_pressed_overlays(). */
 void draw_static_body(SDL_Renderer* r) {
     /* Shell, covering the whole instrument (top strip + panel + deck). */
-    fill(r, {0, 0, DEVICE_W, DEVICE_H}, COL_SHELL, kDrawScale);
+    fill(r, {0, 0, DEVICE_W, dev_h()}, COL_SHELL, kDrawScale);
 
     /* Top strip (slightly darker), carrying the rotate and DFU buttons. */
     fill(r, {0, 0, DEVICE_W, HEADER_H}, shade(COL_SHELL, 0.7), kDrawScale);
@@ -552,11 +569,20 @@ void draw_static_body(SDL_Renderer* r) {
     fill(r, {PANEL_X - BEZEL, PANEL_Y - BEZEL, PANEL_W + 2 * BEZEL, PANEL_H + 2 * BEZEL},
          COL_BEZEL, kDrawScale);
 
-    /* Control deck below the panel (slightly darker than the shell). */
-    fill(r, {MARGIN, DECK_Y, DEVICE_W - 2 * MARGIN, DECK_H},
-         shade(COL_SHELL, 0.82), kDrawScale);
+    /* Control deck below the panel (slightly darker than the shell). Hidden in
+     * "touchscreen only" mode, which is the whole point of dev_h() shrinking. */
+    if (g_deck_visible) {
+        fill(r, {MARGIN, DECK_Y, DEVICE_W - 2 * MARGIN, DECK_H},
+             shade(COL_SHELL, 0.82), kDrawScale);
+    }
+
+    /* Bottom silkscreen band, a touch darker still, with a separator line. */
+    fill(r, {0, dev_h() - FOOTER_H, DEVICE_W, FOOTER_H},
+         shade(COL_SHELL, 0.72), kDrawScale);
+    fill(r, {0, dev_h() - FOOTER_H, DEVICE_W, 1}, COL_SHELL_EDGE, kDrawScale);
 
     /* Encoder knob: a round cap with a blue LED ring around it. */
+    if (g_deck_visible) {
     const int wcx = g_wheel_rect.x + g_wheel_rect.w / 2;
     const int wcy = g_wheel_rect.y + g_wheel_rect.h / 2;
     const int wrad = g_wheel_rect.w / 2;
@@ -583,9 +609,11 @@ void draw_static_body(SDL_Renderer* r) {
             }
         }
     }
+    }
 
     /* The five-way cross, always in the unpressed state here; a press is painted
      * by draw_pressed_overlays(). Its centre is drawn last so it overlaps. */
+    if (g_deck_visible) {
     for (const auto& b : kButtons) {
         fill(r, b.rect, COL_BTN, kDrawScale);
         fill(r, {b.rect.x, b.rect.y, b.rect.w, 2}, COL_BTN_EDGE, kDrawScale);
@@ -595,10 +623,22 @@ void draw_static_body(SDL_Renderer* r) {
         draw_text(r, b.rect.x + (b.rect.w - tw) / 2, b.rect.y + (b.rect.h - 7) / 2,
                   b.label, COL_LABEL, 1);
     }
+    }
+
+    /* Owner handle, pixel letters, right-aligned on the bottom silkscreen
+     * band (host-only branding, like the print on a real PortaPack). Static,
+     * so it bakes into the body texture together with the rest of the shell. */
+    {
+        const char* handle = "@CARDPUTER_ZERO";
+        const int hw = text_width(handle, 1);
+        const int hy = dev_h() - FOOTER_H + (FOOTER_H - 7) / 2;
+        draw_text(r, DEVICE_W - MARGIN - 2 - hw, hy, handle,
+                  shade(COL_LABEL, 0.6), 1);
+    }
 
     /* Shell inner edge for depth. */
     SDL_SetRenderDrawColor(r, 0x1c, 0x1c, 0x1c, 0xff);
-    SDL_Rect edge{1 * kDrawScale, 1 * kDrawScale, (DEVICE_W - 2) * kDrawScale, (DEVICE_H - 2) * kDrawScale};
+    SDL_Rect edge{1 * kDrawScale, 1 * kDrawScale, (DEVICE_W - 2) * kDrawScale, (dev_h() - 2) * kDrawScale};
     SDL_RenderDrawRect(r, &edge);
 }
 
@@ -621,6 +661,7 @@ void draw_pressed_overlays(SDL_Renderer* r) {
         paint(g_dfu_rect, "DFU");
         return;
     }
+    if (!g_deck_visible) return;
     for (const auto& box : kButtons) {
         if (box.btn == b) {
             paint(box.rect, box.label);
@@ -1166,7 +1207,7 @@ bool quit_requested() {
  * frame at an angle. */
 void ensure_device_texture() {
     const int w = DEVICE_W * kDrawScale;
-    const int h = DEVICE_H * kDrawScale;
+    const int h = dev_h() * kDrawScale;
     if (g_device_texture) {
         int tw = 0, th = 0;
         SDL_QueryTexture(g_device_texture, nullptr, nullptr, &tw, &th);
@@ -1184,7 +1225,7 @@ void ensure_device_texture() {
  * have a valid g_renderer. */
 void ensure_static_texture() {
     const int w = DEVICE_W * kDrawScale;
-    const int h = DEVICE_H * kDrawScale;
+    const int h = dev_h() * kDrawScale;
     if (g_static_texture) {
         int tw = 0, th = 0;
         SDL_QueryTexture(g_static_texture, nullptr, nullptr, &tw, &th);
@@ -1251,6 +1292,38 @@ void render() {
 int device_width() { return DEVICE_W; }
 int device_height() { return DEVICE_H; }
 int scale() { return g_scale; }
+
+void set_deck_visible(bool on) {
+    if (g_deck_visible == on) return;
+    g_deck_visible = on;
+    /* The body extent changed, so the floating window must follow; while
+     * fullscreen the compositor owns the size and render() recentres instead.
+     * The off-screen textures are rebuilt lazily because their size changed. */
+    if (!g_fullscreen && g_window != nullptr) {
+        int w = 0, h = 0;
+        current_window_size(w, h);
+        SDL_SetWindowSize(g_window, w, h);
+    }
+    g_needs_redraw = true;
+}
+
+bool deck_visible() { return g_deck_visible; }
+
+void set_rotation(int degrees) {
+    int d = ((degrees % 360) + 360) % 360;
+    d = (d / 90) * 90;
+    if (d == g_rotation) return;
+    g_rotation = d;
+    layout_controls();
+    if (!g_fullscreen && g_window != nullptr) {
+        int w = 0, h = 0;
+        current_window_size(w, h);
+        SDL_SetWindowSize(g_window, w, h);
+    }
+    g_needs_redraw = true;
+}
+
+int rotation() { return g_rotation; }
 
 bool consume_redraw() {
     const bool needed = g_needs_redraw;

@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -142,6 +143,52 @@ std::vector<std::string> wrap(const std::string& text, int max_chars) {
 }
 
 /* ---------------------------------------------------------------------- */
+/* Persisted host settings.                                                 */
+/*                                                                        */
+/* The only host-side setting saved between runs is the window rotation the  */
+/* user picked in this window; it is kept in a tiny INI-ish file under the   */
+/* XDG config dir so the next launch starts turned the same way.             */
+/* ---------------------------------------------------------------------- */
+
+fs::path config_path() {
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    fs::path base;
+    if (xdg && *xdg) {
+        base = fs::path(xdg);
+    } else if (const char* home = std::getenv("HOME")) {
+        base = fs::path(home) / ".config";
+    } else {
+        base = fs::path(".config");
+    }
+    return base / "mayhem-desktop" / "settings.conf";
+}
+
+int snap_rotation(int v) {
+    v = ((v % 360) + 360) % 360;
+    return (v / 90) * 90;
+}
+
+int load_saved_rotation() {
+    std::ifstream in(config_path());
+    if (!in) return 0;
+    const std::string key = "rotation=";
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind(key, 0) == 0)
+            return snap_rotation(std::atoi(line.c_str() + key.size()));
+    }
+    return 0;
+}
+
+void store_saved_rotation(int degrees) {
+    std::error_code ec;
+    const fs::path p = config_path();
+    fs::create_directories(p.parent_path(), ec);
+    std::ofstream out(p, std::ios::trunc);
+    if (out) out << "rotation=" << snap_rotation(degrees) << "\n";
+}
+
+/* ---------------------------------------------------------------------- */
 /* Layout (panel pixels, 240x320 portrait).                                 */
 /* ---------------------------------------------------------------------- */
 
@@ -150,10 +197,16 @@ constexpr int kRowW = host_lcd::WIDTH - 12;
 
 constexpr int kBrowseY = 86;
 constexpr int kBrowseH = 24;
-constexpr int kDriverY = 138;
-constexpr int kDriverH = 26;
-constexpr int kDeviceY = 170;
-constexpr int kDeviceH = 26;
+constexpr int kDriverY = 126;
+constexpr int kDriverH = 24;
+constexpr int kDeviceY = 154;
+constexpr int kDeviceH = 24;
+constexpr int kModeLabelY = 186;
+constexpr int kModeY = 194;
+constexpr int kModeH = 30;
+constexpr int kRotateLabelY = 230;
+constexpr int kRotateY = 238;
+constexpr int kRotateH = 28;
 constexpr int kBtnY = 278;
 constexpr int kBtnH = 34;
 constexpr int kStartX = 6;
@@ -162,7 +215,7 @@ constexpr int kQuitX = 122;
 constexpr int kQuitW = 112;
 
 struct Focus {
-    enum Value { Browse = 0, Driver, Device, Start, Quit, Count };
+    enum Value { Browse = 0, Driver, Device, Mode, Rotate, Start, Quit, Count };
 };
 
 bool point_in(int x, int y, int rx, int ry, int rw, int rh) {
@@ -332,6 +385,17 @@ Result run(const std::string& default_sd, int scale) {
     int driver_idx = 0;
     int device_idx = 0;
     int focus = Focus::Browse;
+    bool touch_only = false;  /* false = touch + on-screen buttons (default) */
+
+    /* Window rotation, restored from the previous session's saved default and
+     * applied immediately so the setup window is already turned. */
+    int rotation_deg = load_saved_rotation();
+    lcd_sdl::set_rotation(rotation_deg);
+    auto cycle_rotation = [&](int dir) {
+        int idx = (rotation_deg / 90 + dir + 4) % 4;
+        rotation_deg = idx * 90;
+        lcd_sdl::set_rotation(rotation_deg);
+    };
 
     auto sync_device_idx = [&] {
         device_idx = 0;
@@ -363,6 +427,10 @@ Result run(const std::string& default_sd, int scale) {
                         } else if (focus == Focus::Device) {
                             auto devs = devices_for(drivers.empty() ? "" : drivers[driver_idx], all_devices);
                             if (!devs.empty()) device_idx = (device_idx + devs.size() - 1) % devs.size();
+                        } else if (focus == Focus::Mode) {
+                            touch_only = !touch_only;
+                        } else if (focus == Focus::Rotate) {
+                            cycle_rotation(-1);
                         }
                         break;
                     }
@@ -373,6 +441,10 @@ Result run(const std::string& default_sd, int scale) {
                         } else if (focus == Focus::Device) {
                             auto devs = devices_for(drivers.empty() ? "" : drivers[driver_idx], all_devices);
                             if (!devs.empty()) device_idx = (device_idx + 1) % devs.size();
+                        } else if (focus == Focus::Mode) {
+                            touch_only = !touch_only;
+                        } else if (focus == Focus::Rotate) {
+                            cycle_rotation(+1);
                         }
                         break;
                     }
@@ -395,6 +467,12 @@ Result run(const std::string& default_sd, int scale) {
                     focus = Focus::Device;
                     auto devs = devices_for(drivers.empty() ? "" : drivers[driver_idx], all_devices);
                     if (!devs.empty()) device_idx = (device_idx + 1) % devs.size();
+                } else if (point_in(ev.x, ev.y, kRowX, kModeY, kRowW, kModeH)) {
+                    focus = Focus::Mode;
+                    touch_only = !touch_only;
+                } else if (point_in(ev.x, ev.y, kRowX, kRotateY, kRowW, kRotateH)) {
+                    focus = Focus::Rotate;
+                    cycle_rotation(+1);
                 } else if (point_in(ev.x, ev.y, kStartX, kBtnY, kStartW, kBtnH)) {
                     focus = Focus::Start;
                     activate = true;
@@ -419,7 +497,15 @@ Result run(const std::string& default_sd, int scale) {
                 }
                 case Focus::Start:
                     result.start = true;
+                    result.rotation = rotation_deg;
+                    store_saved_rotation(rotation_deg);
                     done = true;
+                    break;
+                case Focus::Mode:
+                    touch_only = !touch_only;
+                    break;
+                case Focus::Rotate:
+                    cycle_rotation(+1);
                     break;
                 case Focus::Quit:
                     result.start = false;
@@ -457,7 +543,7 @@ Result run(const std::string& default_sd, int scale) {
         }
 
         /* Device section. */
-        draw_text(ui::font::fixed_5x8, kRowX, 120, "SDR DEVICE", COL_SECTION, COL_BG);
+        draw_text(ui::font::fixed_5x8, kRowX, 112, "SDR DEVICE", COL_SECTION, COL_BG);
 
         {
             const bool sel = (focus == Focus::Driver);
@@ -485,6 +571,42 @@ Result run(const std::string& default_sd, int scale) {
             draw_text(ui::font::fixed_5x8, kRowX + 4, kDeviceY + 4,
                       fit_text(ui::font::fixed_5x8, label, kRowW - 8), COL_TEXT,
                       sel ? COL_ROW_FOCUS : COL_ROW);
+        }
+
+        /* Input mode: the default keeps both the touchscreen and the on-screen
+         * button deck; "touchscreen only" hides the deck so the window is just
+         * the screen (top strip and handle stay). Toggled by tap or Left/Right. */
+        draw_text(ui::font::fixed_5x8, kRowX, kModeLabelY, "INPUT MODE", COL_SECTION, COL_BG);
+        {
+            const bool sel = (focus == Focus::Mode);
+            fill_rect(kRowX, kModeY, kRowW, kModeH, sel ? COL_ROW_FOCUS : COL_ROW);
+            const std::string label = touch_only ? "Touchscreen only"
+                                                 : "Touchscreen + buttons";
+            draw_text(ui::font::fixed_5x8, kRowX + 4, kModeY + 4,
+                      fit_text(ui::font::fixed_5x8, label, kRowW - 22), COL_TEXT,
+                      sel ? COL_ROW_FOCUS : COL_ROW);
+            draw_text(ui::font::fixed_5x8, kRowX + kRowW - 14, kModeY + 4,
+                      "<>", COL_TEXT_DIM, sel ? COL_ROW_FOCUS : COL_ROW);
+            draw_text(ui::font::fixed_5x8, kRowX + 4, kModeY + 15,
+                      touch_only ? "screen only, no button deck" : "on-screen button deck shown",
+                      COL_TEXT_DIM, sel ? COL_ROW_FOCUS : COL_ROW);
+        }
+
+        /* Window rotation, saved as the default for the next launch. */
+        draw_text(ui::font::fixed_5x8, kRowX, kRotateLabelY, "WINDOW ROTATION", COL_SECTION, COL_BG);
+        {
+            const bool sel = (focus == Focus::Rotate);
+            fill_rect(kRowX, kRotateY, kRowW, kRotateH, sel ? COL_ROW_FOCUS : COL_ROW);
+            const char* names[4] = {"Portrait", "Landscape", "Portrait flipped", "Landscape flipped"};
+            const std::string label = std::string("Rotation: ") + names[(rotation_deg / 90) % 4];
+            draw_text(ui::font::fixed_5x8, kRowX + 4, kRotateY + 4,
+                      fit_text(ui::font::fixed_5x8, label, kRowW - 22), COL_TEXT,
+                      sel ? COL_ROW_FOCUS : COL_ROW);
+            draw_text(ui::font::fixed_5x8, kRowX + kRowW - 14, kRotateY + 4,
+                      "<>", COL_TEXT_DIM, sel ? COL_ROW_FOCUS : COL_ROW);
+            draw_text(ui::font::fixed_5x8, kRowX + 4, kRotateY + 15,
+                      "default, saved for next launch",
+                      COL_TEXT_DIM, sel ? COL_ROW_FOCUS : COL_ROW);
         }
 
         /* Bottom buttons. */
@@ -521,8 +643,11 @@ Result run(const std::string& default_sd, int scale) {
         auto devs = devices_for(result.driver, all_devices);
         if (!devs.empty()) result.device_args = devs[device_idx].args;
     }
+    result.touch_only = touch_only;
 
     return result;
 }
+
+int saved_rotation() { return load_saved_rotation(); }
 
 }  // namespace host_launcher

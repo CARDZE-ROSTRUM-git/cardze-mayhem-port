@@ -28,7 +28,14 @@ struct Result {
     std::string sd_dir;       /* chosen SD folder */
     std::string driver;       /* "rtlsdr" or "pluto" */
     std::string device_args;  /* driver-specific device hint */
+    bool touch_only{false};   /* true = hide the on-screen button deck */
+    int rotation{0};          /* body rotation in degrees: 0/90/180/270 */
 };
+
+/* Body rotation saved as the default by a previous setup session (degrees,
+ * 0/90/180/270). Read at startup so a headless/skip-launcher boot still turns
+ * the window the way the user left it. */
+int saved_rotation();
 
 /* Shows the setup window and blocks until the user presses Start or Quit (or
  * closes the window, which counts as Quit). `default_sd` seeds the folder

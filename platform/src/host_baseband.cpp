@@ -65,6 +65,7 @@
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <complex>
 #include <cstring>
 #include <cstdint>
@@ -127,7 +128,7 @@ int32_t g_filter_transition = 0;
 std::unique_ptr<StreamInput> g_stream{};
 
 /* Spectrum path (waterfall). */
-bool g_streaming = false;
+std::atomic<bool> g_streaming{false};
 ChannelSpectrum g_spectrum_fifo_data[1 << ChannelSpectrumConfigMessage::fifo_k]{};
 ChannelSpectrumFIFO g_spectrum_fifo{g_spectrum_fifo_data, ChannelSpectrumConfigMessage::fifo_k};
 std::array<complex16_t, 256> g_fft_raw{};
@@ -178,6 +179,42 @@ void feed_spectrum() {
 
     /* Wake the UI so it drains the FIFO on its next frame. */
     EventDispatcher::check_fifo_isr();
+}
+
+/* Fallback waterfall feed for images that never run the receive chain. While
+ * the radio transmits (the Replay/Playlist/Remote apps, which all load the
+ * replay image) or idles on a backend without a TX path, process()/emit() are
+ * never reached, so the app's WaterfallView would sit on its cleared black
+ * rectangle - the dead black band seen when opening Remote. Feed a dim,
+ * slightly noisy floor at the same ~50 Hz frame rate so the band scrolls and
+ * the app looks alive. Harmless for RX: it only runs when streaming is on and
+ * no real spectrum is being produced. */
+void feed_floor_spectrum() {
+    ChannelSpectrum spectrum;
+    spectrum.sampling_rate = 0;
+    spectrum.channel_filter_low_frequency = 0;
+    spectrum.channel_filter_high_frequency = 0;
+    spectrum.channel_filter_transition = 0;
+    static uint32_t s = 0x1234567u;
+    for (size_t i = 0; i < spectrum.db.size(); i++) {
+        s = s * 1664525u + 1013904223u;
+        /* A narrow band around a low level (about -43 dBv), so the gradient
+         * paints a dim but clearly non-black floor. */
+        spectrum.db[i] = static_cast<uint8_t>(44 + ((s >> 25) & 0x07));
+    }
+    g_spectrum_fifo.in(spectrum);
+    EventDispatcher::check_fifo_isr();
+}
+
+/* Rate-limits feed_floor_spectrum() to the waterfall's ~50 Hz frame clock when
+ * called from the tight transmit/idle loops of the producer thread. */
+void feed_floor_if_due() {
+    if (!g_streaming) return;
+    static std::chrono::steady_clock::time_point last{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::milliseconds(20)) return;
+    last = now;
+    feed_floor_spectrum();
 }
 
 /* Mirror of CaptureProcessor::feed_spectrum: copy at most the samples left for
@@ -1079,6 +1116,8 @@ void producer_thread() {
             std::lock_guard<std::mutex> lk(g_mutex);
             const size_t n = tx_replay_read(tx_raw.data(), kBufferSamples);
             device->write(tx_raw.data(), n);
+            /* TX has no RX stream to analyse: keep the waterfall alive. */
+            feed_floor_if_due();
             continue;
         }
 
@@ -1092,6 +1131,8 @@ void producer_thread() {
                              "has no TX path; replay will not radiate\n");
                 tx_warned = true;
             }
+            /* No TX path and no RX stream: still keep the waterfall alive. */
+            feed_floor_if_due();
             chThdSleepMilliseconds(20);
             continue;
         }
