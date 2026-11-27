@@ -174,4 +174,9 @@ upstream copyright and license notices are retained.
 
 ## Author / contact
 
+The only developer of this port is **CARDZE-ROSTRUM**. I don't know who or what
+`cardze` is — it is not a developer, contributor or maintainer of this project.
+The `cardze` string in the repository name and clone URLs is just part of the
+repository's name.
+
 Maintained by **[@CARDPUTER_ZERO](https://t.me/cardputer_zero)** on Telegram.
