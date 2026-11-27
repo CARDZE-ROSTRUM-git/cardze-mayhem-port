@@ -27,6 +27,7 @@
 #include "host_baseband.hpp"
 #include "host_radio.hpp"
 #include "sdr_device.hpp"
+#include "host_m4.hpp"
 
 #include "message.hpp"
 #include "portapack_shared_memory.hpp"
@@ -588,6 +589,11 @@ std::unique_ptr<StreamInput> g_audio_stream{};
  * audio output ring. It is updated from m4_init() (see hardware_stubs.cpp). */
 Image g_image = Image::Unknown;
 
+/* True once set_baseband_rate() has configured the generic RX chain for an
+ * Image::Other/Unknown app, so a repeated identical rate is a no-op but a new
+ * app (or a different rate) rebuilds it. Cleared by set_image(). */
+bool g_generic_rx = false;
+
 /* AudioOutput stand-in: block buffer + squelch + two biquads + int16 sink. */
 struct AudioTail {
     BlockDecimator<float, 32> block{1};
@@ -819,6 +825,15 @@ void audio_process(const buffer_c8_t& buffer) {
 }
 
 void audio_configure_nfm(const NBFMConfigureMessage& m) {
+    /* These audio chains assume the 3.072 MS/s audio image. When an M4 decoder
+     * (weather, subghz, POCSAG, ...) owns the IQ stream, its data plane runs at
+     * the rate the app programmed for it and the audio chain is bypassed
+     * entirely (see process()). Configuring it here would clobber the shared
+     * baseband rate, so the decoder and SDR would disagree about the sample
+     * rate - the app then feeds blocks labelled 3.072 MS/s to a decoder
+     * configured for the app's real rate, and nothing decodes. */
+    if (host_m4::active()) return;
+
     constexpr uint32_t baseband_fs = 3072000;
     constexpr uint32_t decim_0_output_fs = baseband_fs / 4;
     constexpr uint32_t audio_decim_0_output_fs = decim_0_output_fs / 2;
@@ -837,6 +852,8 @@ void audio_configure_nfm(const NBFMConfigureMessage& m) {
 }
 
 void audio_configure_am(const AMConfigureMessage& m) {
+    if (host_m4::active()) return; /* see audio_configure_nfm() */
+
     constexpr uint32_t baseband_fs = 3072000;
     constexpr uint32_t decim_0_output_fs = baseband_fs / 4;
     constexpr uint32_t audio_decim_0_output_fs = decim_0_output_fs / 2;
@@ -857,8 +874,9 @@ void audio_configure_am(const AMConfigureMessage& m) {
     g_audio_rate = 12000;
     g_audio_mode = AudioMode::AM;
 }
-
 void audio_configure_wfm(const WFMConfigureMessage& m) {
+    if (host_m4::active()) return; /* see audio_configure_nfm() */
+
     constexpr uint32_t baseband_fs = 3072000;
     constexpr uint32_t decim_0_output_fs = baseband_fs / 4;
 
@@ -875,6 +893,8 @@ void audio_configure_wfm(const WFMConfigureMessage& m) {
 }
 
 void audio_configure_wfmam(const WFMAMConfigureMessage& m) {
+    if (host_m4::active()) return; /* see audio_configure_nfm() */
+
     constexpr uint32_t baseband_fs = 3072000;
     constexpr uint32_t decim_0_output_fs = baseband_fs / 4;
 
@@ -987,6 +1007,17 @@ void emit(const buffer_c16_t& out) {
 void process(const complex8_t* samples, size_t count) {
     const buffer_c8_t buffer{samples, count, g_baseband_fs};
 
+    /* A registered M4 decoder (weather, subghz, POCSAG, ADS-B, ...) owns the
+     * raw IQ stream: hand it the samples untouched at the baseband rate, the
+     * same blocks the device's SGPIO DMA would have delivered. Its own
+     * execute() runs the decimation, demodulation, protocol decoding and (for
+     * the apps that stream one) the waterfall, so the host's generic chain must
+     * stay out of the way to avoid a second, competing spectrum feed. */
+    if (host_m4::active()) {
+        host_m4::feed(reinterpret_cast<const int8_t*>(samples), count, g_baseband_fs);
+        return;
+    }
+
     /* SpecAn sweep mode owns the raw DMA stream: the M0 retunes per slice and
      * the engine FFTs the requested buffers. Decimation below would destroy
      * the wide span the sweep is measuring. */
@@ -1038,6 +1069,7 @@ void producer_thread() {
     double applied_freq = -1.0;
     uint32_t applied_rate = 0;
     double applied_gain = -1.0;
+    bool applied_auto_gain = false;
     int applied_bias = -1; /* -1 = not yet applied */
     double gain_min = 0.0;
     double gain_max = 0.0;
@@ -1072,6 +1104,11 @@ void producer_thread() {
 
         if (!device) {
             if (rate == 0 || freq == 0) {
+                /* No RX stream is configured yet (e.g. the Replay/Remote image,
+                 * which never sends a SampleRateConfig). There is nothing to
+                 * receive, but the app's waterfall may already be streaming, so
+                 * keep it fed instead of leaving it black. */
+                feed_floor_if_due();
                 chThdSleepMicroseconds(2000);
                 continue;
             }
@@ -1079,6 +1116,7 @@ void producer_thread() {
             if (!device) {
                 /* No device (or open failed): keep polling so plugging one in
                  * later is detected without restarting the process. */
+                feed_floor_if_due();
                 chThdSleepMicroseconds(20000);
                 continue;
             }
@@ -1089,6 +1127,7 @@ void producer_thread() {
             applied_freq = -1.0;
             applied_rate = 0;
             applied_gain = -1.0;
+            applied_auto_gain = false;
             applied_bias = -1;
             read_failures = 0;
         }
@@ -1141,6 +1180,8 @@ void producer_thread() {
         if ((double)freq != applied_freq) {
             device->set_center_freq((double)freq);
             applied_freq = (double)freq;
+            std::fprintf(stderr, "host_baseband: center freq -> %llu Hz (applied %.0f)\n",
+                         (unsigned long long)freq, device->center_freq());
         }
         if (rate != 0 && rate != applied_rate) {
             device->set_sample_rate((double)rate);
@@ -1149,15 +1190,26 @@ void producer_thread() {
 
         /* Manual gain: map the firmware's LNA+VGA(+RF amp) onto the tuner's own
          * span. This makes the apps' LNA/VGA sliders and the RF-amp toggle real
-         * instead of the fixed 30 dB the bring-up used. */
-        const double target_gain = map_gain_to_backend(lna_db, vga_db, amp, gain_min, gain_max);
-        if (target_gain != applied_gain) {
-            device->set_gain_mode(true);
-            device->set_gain(target_gain);
-            std::fprintf(stderr,
-                         "host_baseband: gain LNA=%d VGA=%d amp=%d -> %.1f dB\n",
-                         lna_db, vga_db, amp ? 1 : 0, target_gain);
-            applied_gain = target_gain;
+         * instead of the fixed 30 dB the bring-up used. A backend that has no
+         * real gain span (RTL) runs its own AGC instead, once. */
+        if (device->prefers_auto_gain()) {
+            if (!applied_auto_gain) {
+                device->set_gain_mode(false); /* false = automatic */
+                std::fprintf(stderr,
+                             "host_baseband: tuner AGC enabled (backend has no "
+                             "analogue LNA/VGA span)\n");
+                applied_auto_gain = true;
+            }
+        } else {
+            const double target_gain = map_gain_to_backend(lna_db, vga_db, amp, gain_min, gain_max);
+            if (target_gain != applied_gain) {
+                device->set_gain_mode(true);
+                device->set_gain(target_gain);
+                std::fprintf(stderr,
+                             "host_baseband: gain LNA=%d VGA=%d amp=%d -> %.1f dB\n",
+                             lna_db, vga_db, amp ? 1 : 0, target_gain);
+                applied_gain = target_gain;
+            }
         }
 
         /* Antenna bias tee: the firmware requests it for TX and for apps that
@@ -1171,8 +1223,7 @@ void producer_thread() {
 
         const size_t got = device->read(raw.data(), kBufferSamples);
         if (got == 0) {
-            if (++read_failures >= kReadFailLimit) {
-                /* The device is gone. Close and forget it; the next loop pass
+            if (++read_failures >= kReadFailLimit) {                /* The device is gone. Close and forget it; the next loop pass
                  * reopens whatever is attached now. */
                 device->close();
                 device.reset();
@@ -1193,6 +1244,48 @@ void producer_thread() {
 }
 
 }  // namespace
+
+/* Generic receive apps (ADS-B, AIS, EPIRB, 2-Tone, POCSAG, ...) never send a
+ * SampleRateConfig: they configure the radio through ReceiverModel::enable(),
+ * whose update_sampling_rate() calls radio::set_baseband_rate() ->
+ * ClockManager::set_sampling_frequency(). On the device that programs the clock
+ * generator and the M4 image already knows its own rate. On the host the clock
+ * call was a no-op, so g_baseband_fs stayed 0, the producer never opened the SDR
+ * and the app's waterfall sat on a dead black band.
+ *
+ * Learn the rate here and bring up a minimal decimate + spectrum chain. Only for
+ * images that own no other data plane (Image::Other/Unknown): capture, audio,
+ * replay and spec-an configure g_baseband_fs themselves and must not be
+ * clobbered. */
+void set_baseband_rate(const uint32_t rate) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (g_image != Image::Other && g_image != Image::Unknown) return;
+    if (g_spec_an.active()) return; /* the sweep owns the SDR rate */
+    if (rate == 0) return;
+    if (g_generic_rx && g_baseband_fs == rate) return;
+
+    g_generic_rx = true;
+    g_baseband_fs = rate;
+    g_sample_rate = rate / 4;
+    g_oversample = 4;
+    std::fprintf(stderr, "host_baseband: generic RX rate=%u image=%d\n", rate, (int)g_image);
+
+    /* The same 1:4 stage CaptureProcessor uses for OversampleRate::x4. */
+    g_d0_dec4.configure(taps_200k_decim_0.taps, dsp::decimate::c8_to_c32_sat_scalar,
+                        dsp::decimate::FIRC8xR16x24FS4Decim4::Shift::Down);
+    g_stage = 0;
+    g_stage1 = 0;
+
+    g_filter_low_f = (int32_t)(taps_200k_decim_1.low_frequency_normalized * g_sample_rate);
+    g_filter_high_f = (int32_t)(taps_200k_decim_1.high_frequency_normalized * g_sample_rate);
+    g_filter_transition = (int32_t)(taps_200k_decim_1.transition_normalized * g_sample_rate);
+
+    /* ~50 rows/s, as the firmware's spectrum collector paces itself. */
+    g_spectrum_interval_samples = g_sample_rate / (size_t)kSpectrumRateHz;
+    if (g_spectrum_interval_samples == 0) g_spectrum_interval_samples = 1;
+
+    spectrum_reset();
+}
 
 void handle_message(const Message* message) {
     if (!message) return;
@@ -1317,6 +1410,7 @@ void handle_message(const Message* message) {
         case Message::ID::SpectrumStreamingConfig: {
             const auto& m = *reinterpret_cast<const SpectrumStreamingConfigMessage*>(message);
             std::lock_guard<std::mutex> lk(g_mutex);
+            std::fprintf(stderr, "host_baseband: SpectrumStreaming mode=%d\n", (int)m.mode);
             if (m.mode == SpectrumStreamingConfigMessage::Mode::Running) {
                 g_streaming = true;
                 /* Hand the UI the FIFO it should drain for each row. */
@@ -1376,6 +1470,7 @@ void start() {
 void set_image(Image image) {
     std::lock_guard<std::mutex> lk(g_mutex);
     g_image = image;
+    g_generic_rx = false;
     /* A new image owns the whole baseband state. The previous image's SpecAn
      * sweep (if any) must stop, or its Shared pointer dangles when the app
      * that owned it is destroyed. */

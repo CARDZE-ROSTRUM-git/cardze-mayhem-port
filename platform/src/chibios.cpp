@@ -280,6 +280,37 @@ void chSchReadyI(Thread* tp) {
     tp->cv.notify_all();
 }
 
+/* Binary semaphore: taken==true means "not available", so the first wait
+ * blocks until signal(). Matches the ChibiOS chbsem contract the FT8 decoder
+ * relies on to hand a finished capture window to its decode thread. */
+void chBSemInit(BinarySemaphore* bsp, bool taken) {
+    if (!bsp) return;
+    std::lock_guard<std::mutex> lk(bsp->impl);
+    bsp->available = !taken;
+}
+
+void chBSemSignal(BinarySemaphore* bsp) {
+    if (!bsp) return;
+    {
+        std::lock_guard<std::mutex> lk(bsp->impl);
+        bsp->available = true;
+    }
+    bsp->cv.notify_one();
+}
+
+void chBSemWait(BinarySemaphore* bsp) {
+    if (!bsp) return;
+    std::unique_lock<std::mutex> lk(bsp->impl);
+    bsp->cv.wait(lk, [bsp] { return bsp->available; });
+    bsp->available = false;
+}
+
+void chBSemReset(BinarySemaphore* bsp, bool taken) {
+    if (!bsp) return;
+    std::lock_guard<std::mutex> lk(bsp->impl);
+    bsp->available = !taken;
+}
+
 void* chHeapAlloc(void* heap, size_t size) {
     (void)heap;
     return std::malloc(size);

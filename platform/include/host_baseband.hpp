@@ -46,6 +46,12 @@ enum class Image { Unknown, Capture, Audio, Replay, AudioTX, Other };
 /* Records the running baseband image (called from m4_init()). */
 void set_image(Image image);
 
+/* Learns the RX baseband rate for images that configure the radio through
+ * ReceiverModel instead of a SampleRateConfig (see radio::set_baseband_rate).
+ * Called from ClockManager::set_sampling_frequency() on the host. Ignored for
+ * images that own another data plane. */
+void set_baseband_rate(uint32_t rate);
+
 /* Handles the baseband command messages that carry data-plane state
  * (CaptureConfig, ReplayConfig, SampleRateConfig). Called from the command
  * channel consumer for every message; other ids are ignored. */

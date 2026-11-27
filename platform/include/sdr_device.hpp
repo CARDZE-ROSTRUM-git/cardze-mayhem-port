@@ -84,6 +84,17 @@ class Device {
         max_db = 0.0;
     }
 
+    /*
+     * True when this radio has no analogue equivalent of the HackRF's LNA/VGA
+     * stages and should run its own automatic gain control instead. A cheap
+     * DVB-T tuner (RTL) spans only a few dB, so mapping the firmware's 0..116 dB
+     * LNA+VGA span onto it leaves the default setting near the noise floor and
+     * decoders never see a signal. The host baseband then enables AGC once and
+     * ignores the per-app LNA/VGA values. Devices with a real gain span (Pluto)
+     * keep the proportional mapping and return false here.
+     */
+    virtual bool prefers_auto_gain() const { return false; }
+
     /* Bias tee / antenna power, where supported. */
     virtual bool set_bias_tee(bool on) = 0;
 

@@ -18,6 +18,27 @@
  * M4-only firmware/common/simd.hpp, so the unmodified DSP compiles here. */
 #include "host_simd.hpp"
 
+/* host_simd.hpp pulls in complex.hpp, which includes mathdef.hpp and thus
+ * defines the bare `PI` macro in every translation unit. On the device mathdef
+ * is only included where wanted (e.g. adsb.hpp, sonde_packet.cpp), so files
+ * that declare their own `PI` identifier -- vdl2_decoder.cpp's
+ * `constexpr float PI` -- never saw the macro. Undo the leak for the one file
+ * that collides (it opts in with HOST_UNDEF_PI); every other file keeps the
+ * macro, since mathdef.hpp is guarded by #pragma once and would not redefine it
+ * on a later include. */
+#ifdef HOST_UNDEF_PI
+#ifdef PI
+#undef PI
+#endif
+#endif
+
+/* phase_detector.hpp (used by ook.hpp) asserts `sizeof(uint32_t) ==
+ * sizeof(unsigned long)`, which holds on the 32-bit ARM M4 but not on x86-64.
+ * Including the host shadow here first defines its guard, so ook.hpp's own
+ * quoted include of the upstream file becomes a no-op. See
+ * platform/include/phase_detector.hpp. */
+#include "phase_detector.hpp"
+
 /* The upstream LCD driver and backlight code include "portapack_io.hpp" by
  * name, which quoted-include rules would resolve to the firmware tree before
  * any -I shadow. Pre-defining the guard and force-including the host bus here
@@ -63,6 +84,18 @@ extern RTCDriver RTCD1;
 void rtcGetTime(RTCDriver* rtc, RTCTime* timespec);
 void rtcSetTime(RTCDriver* rtc, const RTCTime* timespec);
 
+/* On the device the M4 asserts this doorbell (SEV) when it has produced a
+ * buffer or a message; the M0's M4Core_IRQHandler runs BufferExchange::handle_isr
+ * and EventDispatcher::check_fifo_isr. The host emulates the M4 with its own
+ * thread (platform/src/host_baseband.cpp), which calls this hook for the same
+ * wake-up; defined there, declared here so the port's own baseband sources
+ * (firmware/baseband/stream_input.cpp, stream_output.cpp) compile unchanged.
+ *
+ * Declared at global scope: an extern "C" declaration inside a namespace is
+ * still looked up in that namespace, which would hide it from the M4 shadow
+ * header and host_m4.cpp. */
+extern "C" void host_baseband_m4_doorbell();
+
 namespace lpc43xx {
 
 namespace m4 {
@@ -76,13 +109,6 @@ namespace creg {
 
 namespace m4txevent {
 
-/* On the device the M4 asserts this doorbell (SEV) when it has produced a
- * buffer or a message; the M0's M4Core_IRQHandler runs BufferExchange::handle_isr
- * and EventDispatcher::check_fifo_isr. The host emulates the M4 with its own
- * thread (platform/src/host_baseband.cpp), which calls this hook for the same
- * wake-up; defined there, declared here so the port's own baseband sources
- * (firmware/baseband/stream_input.cpp, stream_output.cpp) compile unchanged. */
-extern "C" void host_baseband_m4_doorbell();
 inline void assert_event() { host_baseband_m4_doorbell(); }
 inline void clear() {}
 inline void enable() {}
@@ -131,6 +157,11 @@ struct RTC : public RTCTime {
     constexpr RTC()
         : RTCTime{0, 0} {
     }
+
+    /* Timestamp::now() on the M0 side is lpc43xx::rtc::RTC::now(). The device
+     * reads the RTC registers; here it returns the host wall clock, packed in
+     * the same BCD-free layout the struct getters below expect. */
+    static RTC now();
 
     uint16_t year() const {
         return (tv_date >> 16) & 0xfff;

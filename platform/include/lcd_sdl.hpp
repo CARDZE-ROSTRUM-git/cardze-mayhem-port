@@ -68,11 +68,12 @@ void inject_mouse_click(int window_x, int window_y);
 /* host_launcher to drain. Scale (1/2/3) and rotation (R) keep working.       */
 /* ---------------------------------------------------------------------- */
 struct LauncherEvent {
-    enum class Type { Click, Key, Quit };
+    enum class Type { Click, Release, Key, Quit };
     Type type;
-    int x{0};    /* Click: panel pixel X */
-    int y{0};    /* Click: panel pixel Y */
-    int key{0};  /* Key: SDL_Keycode */
+    int x{0};       /* Click/Release: panel pixel X */
+    int y{0};       /* Click/Release: panel pixel Y */
+    int key{0};     /* Key: SDL_Keycode (layout-dependent symbol) */
+    int scancode{0}; /* Key: SDL_Scancode (physical key, layout-independent) */
 };
 
 /* Toggle launcher mode on the SDL layer. */
@@ -80,6 +81,20 @@ void set_launcher_mode(bool on);
 
 /* Dequeues one setup-window event; false when the queue is empty. */
 bool launcher_poll(LauncherEvent& out);
+
+/* Key-capture mode for the setup window's binding editor. While active, the
+ * next key press is recorded instead of being delivered as a launcher Key
+ * event, so the editor can read the physical scancode it should bind. */
+void begin_key_capture();
+void cancel_key_capture();
+/* True once a key has been captured; fills `scancode` and clears the latch. */
+bool poll_captured_scancode(int& scancode);
+/* True while a capture is still pending (not yet satisfied or cancelled). */
+bool key_capture_active();
+
+/* Layout-independent display name for a scancode ("A", "Up", "Left Ctrl", ...),
+ * used by the setup window to label the current binding. */
+const char* scancode_name(int scancode);
 
 }  // namespace lcd_sdl
 

@@ -23,11 +23,17 @@ fi
 export MAYHEM_SD
 mkdir -p "$MAYHEM_SD"
 
-# Let SDL pick the video driver for the running session; only force x11 when the
-# session advertises no Wayland display, to avoid a blank window.
-if [ -z "${SDL_VIDEODRIVER:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ -n "${DISPLAY:-}" ]; then
-    SDL_VIDEODRIVER=x11
-    export SDL_VIDEODRIVER
+# Prefer the native Wayland driver when the session offers one: SDL2 otherwise
+# picks x11 (XWayland) whenever DISPLAY is also set, and under niri the XWayland
+# window renders empty/garbled. Fall back to x11 only when there is no Wayland
+# display, and always keep an explicit operator override.
+if [ -z "${SDL_VIDEODRIVER:-}" ]; then
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        SDL_VIDEODRIVER=wayland
+    elif [ -n "${DISPLAY:-}" ]; then
+        SDL_VIDEODRIVER=x11
+    fi
+    [ -n "${SDL_VIDEODRIVER:-}" ] && export SDL_VIDEODRIVER
 fi
 
 exec "$APP" "$@"

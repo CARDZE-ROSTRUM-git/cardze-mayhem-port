@@ -38,6 +38,7 @@
 
 #include "host_input.hpp"
 #include "host_audio.hpp"
+#include "host_m4.hpp"
 #include "host_baseband.hpp"
 #include "host_lcd.hpp"
 #include "host_battery.hpp"
@@ -206,6 +207,15 @@ bool service_baseband_channel() {
     if (message == nullptr) return false;
 
     host_baseband::handle_message(message);
+
+    /* Forward the command to the real M4 processor image (if one is running):
+     * this is the host stand-in for the M4 event loop's on_message(). Decoders
+     * learn their modulation/rate from SubGhzFPRxConfigure and similar here. */
+    if (message->id == Message::ID::Shutdown) {
+        host_m4::stop_image();
+    } else {
+        host_m4::on_message(message);
+    }
 
     switch (message->id) {
         case Message::ID::AudioBeep: {

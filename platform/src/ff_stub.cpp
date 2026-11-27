@@ -280,6 +280,20 @@ FRESULT f_open(FIL* fp, const TCHAR* path, BYTE mode) {
     if (!fp) return FR_INVALID_OBJECT;
     const std::string host = host_path(path);
 
+    /* FatFs opens files, never directories: f_open("") or a directory path
+     * fails with FR_NO_FILE. On the host fopen() happily opens a directory (it
+     * only fails on the first read), so an empty/"directory" path would hand the
+     * firmware an open handle whose reads return zero bytes without ever
+     * reaching EOF. FileLineReader then advances by the (empty) line length and
+     * spins forever - the remote app's load hangs the UI at 100% CPU. Reject it
+     * here to match the device. */
+    {
+        struct stat st{};
+        if (::stat(host.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+            return FR_NO_FILE;
+        }
+    }
+
     const char* fopen_mode = nullptr;
     bool exclusive = false;
 

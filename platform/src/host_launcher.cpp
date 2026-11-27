@@ -18,6 +18,7 @@
 #include "host_launcher.hpp"
 
 #include "host_lcd.hpp"
+#include "host_settings.hpp"
 #include "lcd_sdl.hpp"
 #include "sdr_device.hpp"
 
@@ -35,6 +36,7 @@
 #include "ui_font_fixed_8x16.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -143,79 +145,45 @@ std::vector<std::string> wrap(const std::string& text, int max_chars) {
 }
 
 /* ---------------------------------------------------------------------- */
-/* Persisted host settings.                                                 */
-/*                                                                        */
-/* The only host-side setting saved between runs is the window rotation the  */
-/* user picked in this window; it is kept in a tiny INI-ish file under the   */
-/* XDG config dir so the next launch starts turned the same way.             */
-/* ---------------------------------------------------------------------- */
-
-fs::path config_path() {
-    const char* xdg = std::getenv("XDG_CONFIG_HOME");
-    fs::path base;
-    if (xdg && *xdg) {
-        base = fs::path(xdg);
-    } else if (const char* home = std::getenv("HOME")) {
-        base = fs::path(home) / ".config";
-    } else {
-        base = fs::path(".config");
-    }
-    return base / "mayhem-desktop" / "settings.conf";
-}
-
-int snap_rotation(int v) {
-    v = ((v % 360) + 360) % 360;
-    return (v / 90) * 90;
-}
-
-int load_saved_rotation() {
-    std::ifstream in(config_path());
-    if (!in) return 0;
-    const std::string key = "rotation=";
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.rfind(key, 0) == 0)
-            return snap_rotation(std::atoi(line.c_str() + key.size()));
-    }
-    return 0;
-}
-
-void store_saved_rotation(int degrees) {
-    std::error_code ec;
-    const fs::path p = config_path();
-    fs::create_directories(p.parent_path(), ec);
-    std::ofstream out(p, std::ios::trunc);
-    if (out) out << "rotation=" << snap_rotation(degrees) << "\n";
-}
-
-/* ---------------------------------------------------------------------- */
 /* Layout (panel pixels, 240x320 portrait).                                 */
 /* ---------------------------------------------------------------------- */
 
 constexpr int kRowX = 6;
 constexpr int kRowW = host_lcd::WIDTH - 12;
 
+/* Main page. */
 constexpr int kBrowseY = 86;
-constexpr int kBrowseH = 24;
-constexpr int kDriverY = 126;
-constexpr int kDriverH = 24;
-constexpr int kDeviceY = 154;
-constexpr int kDeviceH = 24;
-constexpr int kModeLabelY = 186;
-constexpr int kModeY = 194;
-constexpr int kModeH = 30;
-constexpr int kRotateLabelY = 230;
-constexpr int kRotateY = 238;
-constexpr int kRotateH = 28;
-constexpr int kBtnY = 278;
-constexpr int kBtnH = 34;
+constexpr int kBrowseH = 22;
+/* Device section header: a filled band with a large centered caption, so the
+ * "SDR DEVICE" grouping reads as a heading instead of a dim 5x8 label that the
+ * driver row below it used to overlap. */
+constexpr int kDevHeadY = 112;
+constexpr int kDevHeadH = 20;
+constexpr int kDriverY = 136;
+constexpr int kDriverH = 22;
+constexpr int kDeviceY = 160;
+constexpr int kDeviceH = 22;
+constexpr int kControlsY = 194;
+constexpr int kControlsH = 26;
+constexpr int kBattY = 226;
+constexpr int kBattH = 26;
+constexpr int kBtnY = 276;
+constexpr int kBtnH = 36;
 constexpr int kStartX = 6;
 constexpr int kStartW = 112;
 constexpr int kQuitX = 122;
 constexpr int kQuitW = 112;
 
+/* Controls & Display page rows. */
+constexpr int kCDRowH = 30;
+constexpr int kCDTop = 40;
+
+/* Key-bindings page: one row per remappable action. */
+constexpr int kBindRowH = 18;
+constexpr int kBindTop = 34;
+
 struct Focus {
-    enum Value { Browse = 0, Driver, Device, Mode, Rotate, Start, Quit, Count };
+    enum Value { Browse = 0, Driver, Device, Controls, Battery, Start, Quit, Count };
 };
 
 bool point_in(int x, int y, int rx, int ry, int rw, int rh) {
@@ -372,7 +340,361 @@ bool browse_dialog(fs::path& current, int scale) {
     }
 }
 
+/* ---------------------------------------------------------------------- */
+/* Key bindings are stored as physical scancodes (see host_settings), so     */
+/* the two dialogs below can rebind them: Controls & Display offers the       */
+/* mode/rotation/wheel options plus a way into the key editor.                */
+/* ---------------------------------------------------------------------- */
+
+bool key_bindings_dialog();
+
+/* ---------------------------------------------------------------------- */
+/* Key-bindings editor.                                                     */
+/*                                                                          */
+/* One row per remappable action. Selecting a row starts a capture: the       */
+/* next physical key pressed becomes the binding (Escape cancels). Bindings   */
+/* are physical scancodes, so they are independent of the keyboard layout.    */
+/* ---------------------------------------------------------------------- */
+
+bool key_bindings_dialog() {
+    const int count = static_cast<int>(host_settings::Action::Count);
+    int sel = 0;
+    bool capturing = false;
+    host_settings::Action capturing_action = host_settings::Action::NavUp;
+
+    auto commit = [&] { host_settings::save(); };
+
+    auto begin_capture = [&](int row) {
+        capturing_action = static_cast<host_settings::Action>(row);
+        capturing = true;
+        lcd_sdl::begin_key_capture();
+    };
+
+    for (;;) {
+        lcd_sdl::pump();
+
+        /* A captured key (if any) becomes the new binding. */
+        int scan = 0;
+        if (lcd_sdl::poll_captured_scancode(scan)) {
+            host_settings::set_scancode(capturing_action, scan);
+            capturing = false;
+            commit();
+        } else if (capturing && !lcd_sdl::key_capture_active()) {
+            /* Capture was cancelled (Escape). */
+            capturing = false;
+        }
+
+        bool leave = false;
+        lcd_sdl::LauncherEvent ev;
+        while (lcd_sdl::launcher_poll(ev)) {
+            if (ev.type == lcd_sdl::LauncherEvent::Type::Quit) {
+                leave = true;
+            } else if (ev.type == lcd_sdl::LauncherEvent::Type::Key) {
+                if (capturing) continue; /* keys are being captured, not navigated */
+                switch (ev.key) {
+                    case SDLK_ESCAPE: leave = true; break;
+                    case SDLK_UP: sel = (sel + count - 1) % count; break;
+                    case SDLK_DOWN: sel = (sel + 1) % count; break;
+                    case SDLK_RETURN:
+                    case SDLK_KP_ENTER: begin_capture(sel); break;
+                    default: break;
+                }
+            } else if (ev.type == lcd_sdl::LauncherEvent::Type::Click) {
+                if (ev.y >= kBindTop && ev.y < kBindTop + count * kBindRowH) {
+                    sel = (ev.y - kBindTop) / kBindRowH;
+                    if (sel >= 0 && sel < count) begin_capture(sel);
+                } else if (point_in(ev.x, ev.y, kQuitX, kBtnY, kQuitW, kBtnH)) {
+                    leave = true;
+                }
+            }
+        }
+        if (leave) return true;
+
+        fill_rect(0, 0, host_lcd::WIDTH, host_lcd::HEIGHT, COL_BG);
+        fill_rect(0, 0, host_lcd::WIDTH, 26, COL_HEADER);
+        draw_text_center(ui::font::fixed_8x16, 0, 5, host_lcd::WIDTH, "KEY BINDINGS", COL_TEXT, COL_HEADER);
+
+        for (int r = 0; r < count; ++r) {
+            const int y = kBindTop + r * kBindRowH;
+            const bool s = (r == sel);
+            const auto a = static_cast<host_settings::Action>(r);
+            fill_rect(kRowX, y, kRowW, kBindRowH - 1, s ? COL_ROW_FOCUS : COL_ROW);
+            draw_text(ui::font::fixed_5x8, kRowX + 4, y + 3, host_settings::action_label(a), COL_TEXT,
+                      s ? COL_ROW_FOCUS : COL_ROW);
+            std::string keylabel;
+            if (capturing && capturing_action == a) {
+                keylabel = "press key..";
+            } else {
+                keylabel = lcd_sdl::scancode_name(host_settings::scancode(a));
+            }
+            const int kw = text_width(ui::font::fixed_5x8, keylabel);
+            draw_text(ui::font::fixed_5x8, kRowX + kRowW - 6 - kw, y + 3, keylabel,
+                      (capturing && capturing_action == a) ? COL_ACCENT : COL_TEXT,
+                      s ? COL_ROW_FOCUS : COL_ROW);
+        }
+
+        fill_rect(kQuitX, kBtnY, kQuitW, kBtnH, COL_QUIT);
+        draw_text_center(ui::font::fixed_8x16, kQuitX, kBtnY + 9, kQuitW, "BACK",
+                         rgb(40, 10, 10), COL_QUIT);
+
+        lcd_sdl::render();
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+}
+
+bool controls_dialog() {
+    int sel = 0; /* 0 = input mode, 1 = rotation, 2 = wheel, 3 = bindings, 4 = back */
+    constexpr int kRows = 5;
+    bool changed = false;
+
+    /* Applies the input-mode choice immediately so the window previews it. */
+    auto toggle_input_mode = [&] {
+        host_settings::set_touch_only(!host_settings::touch_only());
+        lcd_sdl::set_deck_visible(!host_settings::touch_only());
+        changed = true;
+    };
+    auto cycle_rotation = [&](int dir) {
+        const int idx = (host_settings::rotation() / 90 + dir + 4) % 4;
+        host_settings::set_rotation(idx * 90);
+        lcd_sdl::set_rotation(host_settings::rotation());
+        changed = true;
+    };
+    auto toggle_wheel = [&] {
+        host_settings::set_wheel_inverted(!host_settings::wheel_inverted());
+        changed = true;
+    };
+
+    for (;;) {
+        lcd_sdl::pump();
+        bool leave = false;
+        lcd_sdl::LauncherEvent ev;
+        while (lcd_sdl::launcher_poll(ev)) {
+            if (ev.type == lcd_sdl::LauncherEvent::Type::Quit) {
+                leave = true;
+            } else if (ev.type == lcd_sdl::LauncherEvent::Type::Key) {
+                switch (ev.key) {
+                    case SDLK_ESCAPE: leave = true; break;
+                    case SDLK_UP: sel = (sel + kRows - 1) % kRows; break;
+                    case SDLK_DOWN: sel = (sel + 1) % kRows; break;
+                    case SDLK_LEFT:
+                    case SDLK_RIGHT: {
+                        const int dir = (ev.key == SDLK_RIGHT) ? +1 : -1;
+                        if (sel == 0) {
+                            toggle_input_mode();
+                        } else if (sel == 1) {
+                            cycle_rotation(dir);
+                        } else if (sel == 2) {
+                            toggle_wheel();
+                        }
+                        break;
+                    }
+                    case SDLK_RETURN:
+                    case SDLK_KP_ENTER:
+                        if (sel == 0) {
+                            toggle_input_mode();
+                        } else if (sel == 1) {
+                            cycle_rotation(+1);
+                        } else if (sel == 2) {
+                            toggle_wheel();
+                        } else if (sel == 3) {
+                            key_bindings_dialog();
+                            changed = true;
+                        } else {
+                            leave = true;
+                        }
+                        break;
+                    default: break;
+                }
+            } else if (ev.type == lcd_sdl::LauncherEvent::Type::Click) {
+                const int row = (ev.y - kCDTop) / kCDRowH;
+                if (ev.y >= kCDTop && row >= 0 && row < kRows) {
+                    sel = row;
+                    if (row == 0) {
+                        toggle_input_mode();
+                    } else if (row == 1) {
+                        cycle_rotation(+1);
+                    } else if (row == 2) {
+                        toggle_wheel();
+                    } else if (row == 3) {
+                        key_bindings_dialog();
+                        changed = true;
+                    } else {
+                        leave = true;
+                    }
+                } else if (point_in(ev.x, ev.y, kQuitX, kBtnY, kQuitW, kBtnH)) {
+                    leave = true;
+                }
+            }
+        }
+        if (leave) return changed;
+
+        fill_rect(0, 0, host_lcd::WIDTH, host_lcd::HEIGHT, COL_BG);
+        fill_rect(0, 0, host_lcd::WIDTH, 26, COL_HEADER);
+        draw_text_center(ui::font::fixed_8x16, 0, 5, host_lcd::WIDTH, "CONTROLS & DISPLAY", COL_TEXT, COL_HEADER);
+
+        auto row_rect = [](int r) { return std::array<int, 4>{kRowX, kCDTop + r * kCDRowH, kRowW, kCDRowH - 2}; };
+
+        const char* rot_names[4] = {"Portrait", "Landscape", "Portrait flipped", "Landscape flipped"};
+
+        struct RowText { std::string title; std::string sub; };
+        RowText rows[kRows];
+        rows[0] = {"Input mode", host_settings::touch_only() ? "Touchscreen only" : "Touchscreen + buttons"};
+        rows[1] = {"Window rotation", std::string("Rotation: ") + rot_names[(host_settings::rotation() / 90) % 4]};
+        rows[2] = {"Mouse wheel", host_settings::wheel_inverted() ? "Down = clockwise" : "Up = clockwise"};
+        rows[3] = {"Key bindings", "Remap action keys"};
+        rows[4] = {"Back", "Return to setup"};
+
+        for (int r = 0; r < kRows; ++r) {
+            const bool s = (r == sel);
+            const auto rr = row_rect(r);
+            fill_rect(rr[0], rr[1], rr[2], rr[3], s ? COL_ROW_FOCUS : COL_ROW);
+            draw_text(ui::font::fixed_5x8, kRowX + 4, rr[1] + 4, rows[r].title, COL_TEXT,
+                      s ? COL_ROW_FOCUS : COL_ROW);
+            draw_text(ui::font::fixed_5x8, kRowX + 4, rr[1] + 14, rows[r].sub, COL_TEXT_DIM,
+                      s ? COL_ROW_FOCUS : COL_ROW);
+            if (r <= 2) {
+                draw_text(ui::font::fixed_5x8, kRowX + kRowW - 14, rr[1] + 4, "<>", COL_TEXT_DIM,
+                          s ? COL_ROW_FOCUS : COL_ROW);
+            }
+        }
+
+        {
+            const bool s = (sel == 4);
+            fill_rect(kQuitX, kBtnY, kQuitW, kBtnH, COL_QUIT);
+            draw_text_center(ui::font::fixed_8x16, kQuitX, kBtnY + 9, kQuitW, "BACK",
+                             rgb(40, 10, 10), COL_QUIT);
+            if (s) {
+                fill_rect(kQuitX, kBtnY, kQuitW, 2, COL_TEXT);
+                fill_rect(kQuitX, kBtnY + kBtnH - 2, kQuitW, 2, COL_TEXT);
+            }
+        }
+
+        lcd_sdl::render();
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+}
+
 }  // namespace
+
+/* Numeric entry for the battery capacity. Returns the new value in mAh, 0 for
+ * "auto" (read from the device), or -1 when cancelled. */
+int battery_input_dialog(int current) {
+    std::string buf = (current > 0 && current <= 20000) ? std::to_string(current) : "";
+    bool done = false, cancel = false;
+
+    /* On-screen step buttons for touch/mouse. A tap adds +/-10; holding for a
+     * moment repeats with an accelerating interval. Rects are panel pixels.
+     * Side margins match the 22 px gap above the row so the padding is even. */
+    const int kMinusX = 22, kMinusY = 158, kMinusW = 88, kMinusH = 56;
+    const int kPlusX = 130, kPlusY = 158, kPlusW = 88, kPlusH = 56;
+
+    int hold_dir = 0; /* -1 / +1 while a button is held */
+    std::chrono::steady_clock::time_point hold_start;
+    std::chrono::steady_clock::time_point next_repeat;
+
+    auto current_value = [&]() -> int {
+        return buf.empty() ? 0 : std::atoi(buf.c_str());
+    };
+    auto set_value = [&](int v) {
+        if (v < 0) v = 0;
+        if (v > 20000) v = 20000;
+        buf = (v == 0) ? std::string() : std::to_string(v);
+    };
+    auto step = [&](int dir) {
+        int v = current_value();
+        /* From "auto" a plus tap starts at a sane base, not at 10 mAh. */
+        if (v == 0 && dir > 0) v = 1000;
+        set_value(v + dir * 10);
+    };
+
+    while (!done) {
+        lcd_sdl::pump();
+        lcd_sdl::LauncherEvent ev;
+        while (lcd_sdl::launcher_poll(ev)) {
+            if (ev.type == lcd_sdl::LauncherEvent::Type::Quit) {
+                cancel = true;
+                done = true;
+            } else if (ev.type == lcd_sdl::LauncherEvent::Type::Key) {
+                const int k = ev.key;
+                if (k == SDLK_ESCAPE) {
+                    cancel = true;
+                    done = true;
+                } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                    done = true;
+                } else if (k == SDLK_BACKSPACE) {
+                    if (!buf.empty()) buf.pop_back();
+                } else if (k >= SDLK_0 && k <= SDLK_9) {
+                    if (buf.size() < 5) buf.push_back(static_cast<char>('0' + (k - SDLK_0)));
+                } else if (k >= SDLK_KP_0 && k <= SDLK_KP_9) {
+                    if (buf.size() < 5) buf.push_back(static_cast<char>('0' + (k - SDLK_KP_0)));
+                }
+            } else if (ev.type == lcd_sdl::LauncherEvent::Type::Click) {
+                if (point_in(ev.x, ev.y, kMinusX, kMinusY, kMinusW, kMinusH)) {
+                    step(-1);
+                    hold_dir = -1;
+                    hold_start = std::chrono::steady_clock::now();
+                    next_repeat = hold_start + std::chrono::milliseconds(400);
+                } else if (point_in(ev.x, ev.y, kPlusX, kPlusY, kPlusW, kPlusH)) {
+                    step(+1);
+                    hold_dir = +1;
+                    hold_start = std::chrono::steady_clock::now();
+                    next_repeat = hold_start + std::chrono::milliseconds(400);
+                } else if (point_in(ev.x, ev.y, kStartX, kBtnY, kStartW, kBtnH)) {
+                    done = true;
+                } else if (point_in(ev.x, ev.y, kQuitX, kBtnY, kQuitW, kBtnH)) {
+                    cancel = true;
+                    done = true;
+                }
+            } else if (ev.type == lcd_sdl::LauncherEvent::Type::Release) {
+                hold_dir = 0;
+            }
+        }
+        if (done) break;
+
+        /* Hold-to-repeat: after the initial 400 ms the step interval shrinks
+         * towards 20 ms, so a held button races through the range. */
+        if (hold_dir != 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next_repeat) {
+                step(hold_dir);
+                const auto held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - hold_start).count();
+                int interval = 120 - static_cast<int>(std::min<long long>(100, (held_ms - 400) / 12));
+                if (interval < 20) interval = 20;
+                next_repeat = now + std::chrono::milliseconds(interval);
+            }
+        }
+
+        fill_rect(0, 0, host_lcd::WIDTH, host_lcd::HEIGHT, COL_BG);
+        fill_rect(0, 0, host_lcd::WIDTH, 26, COL_HEADER);
+        draw_text_center(ui::font::fixed_8x16, 0, 5, host_lcd::WIDTH, "BATTERY CAPACITY", COL_TEXT, COL_HEADER);
+        draw_text(ui::font::fixed_5x8, 12, 50, "Type mAh, or use -/+ (10 per tap).", COL_TEXT, COL_BG);
+        draw_text(ui::font::fixed_5x8, 12, 62, "Hold -/+ to change fast.", COL_TEXT_DIM, COL_BG);
+
+        fill_rect(12, 84, host_lcd::WIDTH - 24, 46, COL_ROW);
+        const std::string shown = buf.empty() ? "auto" : (buf + " mAh");
+        draw_text_center(ui::font::fixed_8x16, 12, 100, host_lcd::WIDTH - 24, shown, COL_TEXT, COL_ROW);
+        draw_text_center(ui::font::fixed_5x8, 0, 136, host_lcd::WIDTH,
+                         "Empty / 0 = auto (from device)", COL_TEXT_DIM, COL_BG);
+
+        fill_rect(kMinusX, kMinusY, kMinusW, kMinusH, COL_ROW_FOCUS);
+        draw_text_center(ui::font::fixed_8x16, kMinusX, kMinusY + 18, kMinusW, "-", COL_TEXT, COL_ROW_FOCUS);
+        fill_rect(kPlusX, kPlusY, kPlusW, kPlusH, COL_ROW_FOCUS);
+        draw_text_center(ui::font::fixed_8x16, kPlusX, kPlusY + 18, kPlusW, "+", COL_TEXT, COL_ROW_FOCUS);
+
+        fill_rect(kStartX, kBtnY, kStartW, kBtnH, COL_ACCENT);
+        draw_text_center(ui::font::fixed_8x16, kStartX, kBtnY + 8, kStartW, "OK",
+                         rgb(10, 40, 15), COL_ACCENT);
+        fill_rect(kQuitX, kBtnY, kQuitW, kBtnH, COL_QUIT);
+        draw_text_center(ui::font::fixed_8x16, kQuitX, kBtnY + 8, kQuitW, "CANCEL",
+                         rgb(40, 10, 10), COL_QUIT);
+
+        lcd_sdl::render();
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+
+    if (cancel) return -1;
+    return current_value();
+}
 
 Result run(const std::string& default_sd, int scale) {
     Result result;
@@ -385,17 +707,13 @@ Result run(const std::string& default_sd, int scale) {
     int driver_idx = 0;
     int device_idx = 0;
     int focus = Focus::Browse;
-    bool touch_only = false;  /* false = touch + on-screen buttons (default) */
 
     /* Window rotation, restored from the previous session's saved default and
-     * applied immediately so the setup window is already turned. */
-    int rotation_deg = load_saved_rotation();
-    lcd_sdl::set_rotation(rotation_deg);
-    auto cycle_rotation = [&](int dir) {
-        int idx = (rotation_deg / 90 + dir + 4) % 4;
-        rotation_deg = idx * 90;
-        lcd_sdl::set_rotation(rotation_deg);
-    };
+     * applied immediately so the setup window is already turned. The full host
+     * settings file (rotation, input mode, key bindings, wheel direction) is
+     * loaded here as well; the Controls & Display page edits it in place. */
+    host_settings::load();
+    lcd_sdl::set_rotation(host_settings::rotation());
 
     auto sync_device_idx = [&] {
         device_idx = 0;
@@ -427,10 +745,6 @@ Result run(const std::string& default_sd, int scale) {
                         } else if (focus == Focus::Device) {
                             auto devs = devices_for(drivers.empty() ? "" : drivers[driver_idx], all_devices);
                             if (!devs.empty()) device_idx = (device_idx + devs.size() - 1) % devs.size();
-                        } else if (focus == Focus::Mode) {
-                            touch_only = !touch_only;
-                        } else if (focus == Focus::Rotate) {
-                            cycle_rotation(-1);
                         }
                         break;
                     }
@@ -441,10 +755,6 @@ Result run(const std::string& default_sd, int scale) {
                         } else if (focus == Focus::Device) {
                             auto devs = devices_for(drivers.empty() ? "" : drivers[driver_idx], all_devices);
                             if (!devs.empty()) device_idx = (device_idx + 1) % devs.size();
-                        } else if (focus == Focus::Mode) {
-                            touch_only = !touch_only;
-                        } else if (focus == Focus::Rotate) {
-                            cycle_rotation(+1);
                         }
                         break;
                     }
@@ -467,12 +777,12 @@ Result run(const std::string& default_sd, int scale) {
                     focus = Focus::Device;
                     auto devs = devices_for(drivers.empty() ? "" : drivers[driver_idx], all_devices);
                     if (!devs.empty()) device_idx = (device_idx + 1) % devs.size();
-                } else if (point_in(ev.x, ev.y, kRowX, kModeY, kRowW, kModeH)) {
-                    focus = Focus::Mode;
-                    touch_only = !touch_only;
-                } else if (point_in(ev.x, ev.y, kRowX, kRotateY, kRowW, kRotateH)) {
-                    focus = Focus::Rotate;
-                    cycle_rotation(+1);
+                } else if (point_in(ev.x, ev.y, kRowX, kControlsY, kRowW, kControlsH)) {
+                    focus = Focus::Controls;
+                    activate = true;
+                } else if (point_in(ev.x, ev.y, kRowX, kBattY, kRowW, kBattH)) {
+                    focus = Focus::Battery;
+                    activate = true;
                 } else if (point_in(ev.x, ev.y, kStartX, kBtnY, kStartW, kBtnH)) {
                     focus = Focus::Start;
                     activate = true;
@@ -497,16 +807,17 @@ Result run(const std::string& default_sd, int scale) {
                 }
                 case Focus::Start:
                     result.start = true;
-                    result.rotation = rotation_deg;
-                    store_saved_rotation(rotation_deg);
+                    host_settings::save();
                     done = true;
                     break;
-                case Focus::Mode:
-                    touch_only = !touch_only;
+                case Focus::Controls:
+                    controls_dialog();
                     break;
-                case Focus::Rotate:
-                    cycle_rotation(+1);
+                case Focus::Battery: {
+                    const int v = battery_input_dialog(host_settings::battery_mah());
+                    if (v >= 0) host_settings::set_battery_mah(v);
                     break;
+                }
                 case Focus::Quit:
                     result.start = false;
                     done = true;
@@ -542,8 +853,11 @@ Result run(const std::string& default_sd, int scale) {
                              COL_TEXT, sel ? COL_ROW_FOCUS : COL_ROW);
         }
 
-        /* Device section. */
-        draw_text(ui::font::fixed_5x8, kRowX, 112, "SDR DEVICE", COL_SECTION, COL_BG);
+        /* Device section: a full-width accent band with a large centered
+         * caption, so the heading is unmistakable. */
+        fill_rect(kRowX, kDevHeadY, kRowW, kDevHeadH, COL_SECTION);
+        draw_text_center(ui::font::fixed_8x16, kRowX, kDevHeadY + 2, kRowW,
+                         "SDR DEVICE", rgb(10, 25, 45), COL_SECTION);
 
         {
             const bool sel = (focus == Focus::Driver);
@@ -573,40 +887,26 @@ Result run(const std::string& default_sd, int scale) {
                       sel ? COL_ROW_FOCUS : COL_ROW);
         }
 
-        /* Input mode: the default keeps both the touchscreen and the on-screen
-         * button deck; "touchscreen only" hides the deck so the window is just
-         * the screen (top strip and handle stay). Toggled by tap or Left/Right. */
-        draw_text(ui::font::fixed_5x8, kRowX, kModeLabelY, "INPUT MODE", COL_SECTION, COL_BG);
+        /* Controls & Display entry: opens the page with input mode, rotation,
+         * wheel direction and the key-bindings editor. */
         {
-            const bool sel = (focus == Focus::Mode);
-            fill_rect(kRowX, kModeY, kRowW, kModeH, sel ? COL_ROW_FOCUS : COL_ROW);
-            const std::string label = touch_only ? "Touchscreen only"
-                                                 : "Touchscreen + buttons";
-            draw_text(ui::font::fixed_5x8, kRowX + 4, kModeY + 4,
-                      fit_text(ui::font::fixed_5x8, label, kRowW - 22), COL_TEXT,
-                      sel ? COL_ROW_FOCUS : COL_ROW);
-            draw_text(ui::font::fixed_5x8, kRowX + kRowW - 14, kModeY + 4,
-                      "<>", COL_TEXT_DIM, sel ? COL_ROW_FOCUS : COL_ROW);
-            draw_text(ui::font::fixed_5x8, kRowX + 4, kModeY + 15,
-                      touch_only ? "screen only, no button deck" : "on-screen button deck shown",
-                      COL_TEXT_DIM, sel ? COL_ROW_FOCUS : COL_ROW);
+            const bool sel = (focus == Focus::Controls);
+            fill_rect(kRowX, kControlsY, kRowW, kControlsH, sel ? COL_ROW_FOCUS : COL_ROW);
+            draw_text_center(ui::font::fixed_8x16, kRowX, kControlsY + 6, kRowW,
+                             "Controls & Display", COL_TEXT, sel ? COL_ROW_FOCUS : COL_ROW);
         }
 
-        /* Window rotation, saved as the default for the next launch. */
-        draw_text(ui::font::fixed_5x8, kRowX, kRotateLabelY, "WINDOW ROTATION", COL_SECTION, COL_BG);
+        /* Battery capacity: auto-detected, or a value typed by the user. */
         {
-            const bool sel = (focus == Focus::Rotate);
-            fill_rect(kRowX, kRotateY, kRowW, kRotateH, sel ? COL_ROW_FOCUS : COL_ROW);
-            const char* names[4] = {"Portrait", "Landscape", "Portrait flipped", "Landscape flipped"};
-            const std::string label = std::string("Rotation: ") + names[(rotation_deg / 90) % 4];
-            draw_text(ui::font::fixed_5x8, kRowX + 4, kRotateY + 4,
-                      fit_text(ui::font::fixed_5x8, label, kRowW - 22), COL_TEXT,
-                      sel ? COL_ROW_FOCUS : COL_ROW);
-            draw_text(ui::font::fixed_5x8, kRowX + kRowW - 14, kRotateY + 4,
-                      "<>", COL_TEXT_DIM, sel ? COL_ROW_FOCUS : COL_ROW);
-            draw_text(ui::font::fixed_5x8, kRowX + 4, kRotateY + 15,
-                      "default, saved for next launch",
-                      COL_TEXT_DIM, sel ? COL_ROW_FOCUS : COL_ROW);
+            const bool sel = (focus == Focus::Battery);
+            fill_rect(kRowX, kBattY, kRowW, kBattH, sel ? COL_ROW_FOCUS : COL_ROW);
+            const int mah = host_settings::battery_mah();
+            const std::string label = (mah > 0)
+                                          ? ("Battery: " + std::to_string(mah) + " mAh")
+                                          : std::string("Battery: auto");
+            draw_text_center(ui::font::fixed_8x16, kRowX, kBattY + 6, kRowW,
+                             fit_text(ui::font::fixed_8x16, label, kRowW - 8),
+                             COL_TEXT, sel ? COL_ROW_FOCUS : COL_ROW);
         }
 
         /* Bottom buttons. */
@@ -643,11 +943,12 @@ Result run(const std::string& default_sd, int scale) {
         auto devs = devices_for(result.driver, all_devices);
         if (!devs.empty()) result.device_args = devs[device_idx].args;
     }
-    result.touch_only = touch_only;
+    result.touch_only = host_settings::touch_only();
+    result.rotation = host_settings::rotation();
 
     return result;
 }
 
-int saved_rotation() { return load_saved_rotation(); }
+int saved_rotation() { return host_settings::rotation(); }
 
 }  // namespace host_launcher

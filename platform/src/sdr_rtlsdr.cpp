@@ -52,7 +52,12 @@ class RtlDevice : public Device {
         }
 
         /* DC/1/f are handled downstream by the firmware's DC blocking, so plain
-         * zero-IF is fine; disable the RTL's own offset tuning. */
+         * zero-IF is fine; disable the RTL's own offset tuning. Both AGCs are
+         * left OFF: the RTL2832U *digital* AGC pins the 8-bit stream at +-127,
+         * and the tuner's own auto gain (R820T) slams to maximum on weak or
+         * empty input, saturating the waterfall (solid red/yellow) and flooding
+         * every decoder with noise. Gain is driven manually from the apps'
+         * LNA/VGA sliders through set_gain()/prefers_auto_gain(). */
         rtlsdr_set_offset_tuning(dev_, 0);
         rtlsdr_set_agc_mode(dev_, 0);
 
@@ -119,8 +124,17 @@ class RtlDevice : public Device {
 
     bool set_gain_mode(bool manual) override {
         if (!open_) return false;
-        return rtlsdr_set_tuner_gain_mode(dev_, manual ? 1 : 0) == 0;
+        /* manual == false selects the tuner's own AGC, which is what
+         * prefers_auto_gain() asks the host baseband to request. */
+        const int rc = rtlsdr_set_tuner_gain_mode(dev_, manual ? 1 : 0);
+        return rc == 0;
     }
+
+    /* Drive the tuner with a manual gain mapped from the apps' LNA/VGA sliders.
+     * The RTL is a cheap DVB-T tuner whose span is smaller than the HackRF's
+     * 116 dB chain, but running its own auto gain saturates the front end (the
+     * waterfall goes solid red/yellow), so a mapped manual gain is used. */
+    bool prefers_auto_gain() const override { return false; }
 
     void gain_range(double& min_db, double& max_db) override {
         min_db = 0.0;
@@ -215,7 +229,6 @@ class RtlDevice : public Device {
      * always sees the freshest data. */
     void on_samples(const unsigned char* buf, uint32_t len) {
         if (stopped_.load(std::memory_order_relaxed)) return;
-
         size_t samples = len / 2;
         if (samples == 0) return;
         if (samples > kRingSamples) {

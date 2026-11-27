@@ -32,6 +32,7 @@
 #include "spi_image.hpp"
 
 #include "host_baseband.hpp"
+#include "host_m4.hpp"
 
 #include <array>
 #include <atomic>
@@ -163,14 +164,21 @@ void set_direction(const rf::Direction new_direction) {
 }
 
 bool set_tuning_frequency(const rf::Frequency frequency) {
+    rf::Frequency final_frequency = frequency;
+    std::fprintf(stderr,
+                 "host_radio: set_tuning_frequency req=%llu converter=%d updown=%d conv_freq=%lld rxcorr=%u rxupdown=%d\n",
+                 (unsigned long long)frequency,
+                 (int)portapack::persistent_memory::config_converter(),
+                 (int)portapack::persistent_memory::config_updown_converter(),
+                 (long long)portapack::persistent_memory::config_converter_freq(),
+                 (unsigned)portapack::persistent_memory::config_freq_rx_correction(),
+                 (int)portapack::persistent_memory::config_freq_rx_correction_updown());
     /* Mirror upstream radio::set_tuning_frequency()'s pre-processing, because
      * firmware/application/radio.cpp is not built on the host (it drives the
      * HackRF first-IF/second-IF chips). The up/down converter and the RX/TX
      * frequency corrections are pure persistent-memory arithmetic, so applying
      * them here keeps the converter toggle and the Settings corrections working
      * against the real SDR backend. */
-    rf::Frequency final_frequency = frequency;
-
     if (portapack::persistent_memory::config_converter()) {
         if (portapack::persistent_memory::config_updown_converter()) {
             final_frequency = frequency - portapack::persistent_memory::config_converter_freq();
@@ -224,6 +232,10 @@ void set_baseband_filter_bandwidth_tx(const uint32_t bandwidth_minimum) {
 
 void set_baseband_rate(const uint32_t rate) {
     cached_state.baseband_rate = rate;
+    /* Upstream radio.cpp forwards this to ClockManager::set_sampling_frequency;
+     * on the host this seam replaces that file, so forward it to the baseband
+     * core here as well. Generic receive apps learn their RX rate this way. */
+    host_baseband::set_baseband_rate(rate);
 }
 
 void set_antenna_bias(const bool on) {
@@ -379,6 +391,11 @@ void ClockManager::disable_if_clocks() {}
 
 void ClockManager::set_sampling_frequency(const uint32_t frequency) {
     _base_band_frequency = frequency;
+    /* Feed the RX rate to the host baseband core. Generic receive apps configure
+     * the radio through ReceiverModel (radio::set_baseband_rate -> this call)
+     * rather than a SampleRateConfig, so without this the host M4 never learned
+     * their sample rate and their waterfall stayed dead. */
+    host_baseband::set_baseband_rate(frequency);
 }
 
 void ClockManager::set_reference_ppb(const int32_t ppb) {
@@ -470,6 +487,11 @@ bool m4_init(const portapack::spi_flash::image_tag_t image_tag, const portapack:
         image = host_baseband::Image::AudioTX;
     }
     host_baseband::set_image(image);
+
+    /* Bring up the real M4 processor for this image, if the port registers a
+     * decoder for it (weather, subghz, POCSAG, ADS-B, ...). Images without one
+     * leave the M4 idle and the host's own data planes own the radio. */
+    host_m4::start_image(image_tag);
 
     shared_memory.set_baseband_ready();
     return true;

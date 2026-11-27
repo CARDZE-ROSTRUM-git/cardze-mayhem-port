@@ -35,6 +35,7 @@
 
 #include "host_input.hpp"
 #include "host_lcd.hpp"
+#include "host_settings.hpp"
 
 /* hal.h (force-included) defines __I/__O/__IO as I/O qualifiers for the LPC43xx
  * register block. SDL pulls in <immintrin.h>, whose AVX intrinsics use those
@@ -194,6 +195,13 @@ bool g_launcher_mode = false;
 std::vector<LauncherEvent> g_launcher_events;
 size_t g_launcher_read = 0;
 
+/* Key-capture latch for the setup window's binding editor. While set, the next
+ * non-repeat key-down is stored as g_captured_scancode and swallowed instead of
+ * being queued as a launcher Key. */
+bool g_capturing_key = false;
+bool g_captured_have = false;
+int g_captured_scancode = 0;
+
 /* Device-unit box for the encoder knob, recomputed per scale. */
 SDL_Rect g_wheel_rect{};
 
@@ -303,23 +311,36 @@ void layout_controls() {
     const int wheel_y = DECK_Y + (DECK_H - wheel_size) / 2;
     g_wheel_rect = {wheel_x, wheel_y, wheel_size, wheel_size};
 
-    /* Five-way cross: up / left / select / right / down in a 3x3 grid. */
-    const int btn = 30;
-    const int gap = 2;
-    const int cell = btn + gap;  /* pitch between neighbouring buttons */
+    /* Five-way cross: up / left / select / right / down in a 3x3 grid.
+     * The window scales the two axes independently, so a fixed square in device
+     * units would appear stretched on screen. Size and pitch are compensated by
+     * the current scale: each key looks square and sits equally far from the
+     * centre, whatever shape the window has been resized to. */
+    double s_w = 1.0, s_h = 1.0;
+    current_screen_scale_xy(s_w, s_h);
+    const double s = (s_w + s_h) / 2.0;  /* reference scale for the 30 px key */
+    auto dev = [](double px, double scale) {
+        return std::max(1, static_cast<int>(std::lround(px / scale)));
+    };
+    const int bw = dev(30.0 * s, s_w);  /* key width  in device units */
+    const int bh = dev(30.0 * s, s_h);  /* key height in device units */
+    const int gap_x = dev(2.0 * s, s_w);
+    const int gap_y = dev(2.0 * s, s_h);
+    const int pitch_x = bw + gap_x;
+    const int pitch_y = bh + gap_y;
 
     const int right_area = PANEL_X + PANEL_W - 12;
-    const int cx = right_area - (btn + 2 * cell) + btn / 2;  /* centre of the cross */
+    const int cx = right_area - (bw + 2 * pitch_x) + bw / 2;  /* centre of the cross */
     const int cy = DECK_Y + DECK_H / 2;
 
-    const int centre_x = cx - btn / 2;
-    const int centre_y = cy - btn / 2;
+    const int centre_x = cx - bw / 2;
+    const int centre_y = cy - bh / 2;
 
-    kButtons[0].rect = {centre_x, centre_y - cell, btn, btn};  /* Up */
-    kButtons[1].rect = {centre_x, centre_y + cell, btn, btn};  /* Down */
-    kButtons[2].rect = {centre_x - cell, centre_y, btn, btn};  /* Left */
-    kButtons[3].rect = {centre_x + cell, centre_y, btn, btn};  /* Right */
-    kButtons[4].rect = {centre_x, centre_y, btn, btn};         /* Select */
+    kButtons[0].rect = {centre_x, centre_y - pitch_y, bw, bh};  /* Up */
+    kButtons[1].rect = {centre_x, centre_y + pitch_y, bw, bh};  /* Down */
+    kButtons[2].rect = {centre_x - pitch_x, centre_y, bw, bh};  /* Left */
+    kButtons[3].rect = {centre_x + pitch_x, centre_y, bw, bh};  /* Right */
+    kButtons[4].rect = {centre_x, centre_y, bw, bh};            /* Select */
 }
 
 /* Maps an on-screen control box (device units) for hit-testing. */
@@ -616,8 +637,13 @@ void draw_static_body(SDL_Renderer* r) {
     if (g_deck_visible) {
     for (const auto& b : kButtons) {
         fill(r, b.rect, COL_BTN, kDrawScale);
+        /* All four edges are drawn so the key reads as a square with the same
+         * visible margin on every side (top/bottom only made the vertical gap
+         * look larger than the horizontal one). */
         fill(r, {b.rect.x, b.rect.y, b.rect.w, 2}, COL_BTN_EDGE, kDrawScale);
         fill(r, {b.rect.x, b.rect.y + b.rect.h - 2, b.rect.w, 2}, COL_BTN_EDGE, kDrawScale);
+        fill(r, {b.rect.x, b.rect.y, 2, b.rect.h}, COL_BTN_EDGE, kDrawScale);
+        fill(r, {b.rect.x + b.rect.w - 2, b.rect.y, 2, b.rect.h}, COL_BTN_EDGE, kDrawScale);
 
         const int tw = text_width(b.label, 1);
         draw_text(r, b.rect.x + (b.rect.w - tw) / 2, b.rect.y + (b.rect.h - 7) / 2,
@@ -792,18 +818,25 @@ void tick() {
     }
 }
 
-/* Maps an SDL keyboard key to a host button, if any. */
-bool key_to_button(SDL_Keycode key, host_input::Btn& out) {
-    switch (key) {
-        case SDLK_UP: out = host_input::Btn::Up; return true;
-        case SDLK_DOWN: out = host_input::Btn::Down; return true;
-        case SDLK_LEFT: out = host_input::Btn::Left; return true;
-        case SDLK_RIGHT: out = host_input::Btn::Right; return true;
-        case SDLK_RETURN:
-        case SDLK_KP_ENTER: out = host_input::Btn::Select; return true;
-        case SDLK_ESCAPE: out = host_input::Btn::Dfu; return true;
+/* Maps a host action onto a firmware button, for the six that have one. */
+bool action_to_button(host_settings::Action a, host_input::Btn& out) {
+    switch (a) {
+        case host_settings::Action::NavUp: out = host_input::Btn::Up; return true;
+        case host_settings::Action::NavDown: out = host_input::Btn::Down; return true;
+        case host_settings::Action::NavLeft: out = host_input::Btn::Left; return true;
+        case host_settings::Action::NavRight: out = host_input::Btn::Right; return true;
+        case host_settings::Action::Select: out = host_input::Btn::Select; return true;
+        case host_settings::Action::Dfu: out = host_input::Btn::Dfu; return true;
         default: return false;
     }
+}
+
+/* Maps a physical key (scancode) to a firmware button using the current
+ * bindings, if that key is bound to one. */
+bool key_to_button(int scancode, host_input::Btn& out) {
+    const auto a = host_settings::action_for_scancode(scancode);
+    if (a == host_settings::Action::Count) return false;
+    return action_to_button(a, out);
 }
 
 void apply_scale(int scale, bool center_pointer) {
@@ -866,11 +899,25 @@ void handle_event(const SDL_Event& e) {
         switch (e.type) {
             case SDL_QUIT:
                 g_quit = true;
-                g_launcher_events.push_back({LauncherEvent::Type::Quit, 0, 0, 0});
+                g_launcher_events.push_back({LauncherEvent::Type::Quit, 0, 0, 0, 0});
                 break;
 
             case SDL_KEYDOWN:
                 if (e.key.repeat) break;
+                /* The binding editor asked for the next key: record its
+                 * physical scancode and swallow the event. Handled before the
+                 * scale/rotate shortcuts so any key (including R or F) can be
+                 * bound. Escape cancels the capture instead of being bound, so
+                 * the editor can always be backed out of. */
+                if (g_capturing_key) {
+                    if (e.key.keysym.scancode != SDL_SCANCODE_ESCAPE) {
+                        g_captured_scancode = e.key.keysym.scancode;
+                        g_captured_have = true;
+                    } else {
+                        g_capturing_key = false;
+                    }
+                    break;
+                }
                 if (e.key.keysym.sym == SDLK_1) { apply_scale(1, true); break; }
                 if (e.key.keysym.sym == SDLK_2) { apply_scale(2, true); break; }
                 if (e.key.keysym.sym == SDLK_3) { apply_scale(3, true); break; }
@@ -880,7 +927,8 @@ void handle_event(const SDL_Event& e) {
                     break;
                 }
                 g_launcher_events.push_back(
-                    {LauncherEvent::Type::Key, 0, 0, static_cast<int>(e.key.keysym.sym)});
+                    {LauncherEvent::Type::Key, 0, 0, static_cast<int>(e.key.keysym.sym),
+                     static_cast<int>(e.key.keysym.scancode)});
                 break;
 
             case SDL_MOUSEBUTTONDOWN: {
@@ -905,6 +953,16 @@ void handle_event(const SDL_Event& e) {
                 break;
             }
 
+            case SDL_MOUSEBUTTONUP: {
+                if (e.button.button != SDL_BUTTON_LEFT) break;
+                int dx = 0, dy = 0;
+                window_to_device(e.button.x, e.button.y, dx, dy);
+                /* Reported so the battery +/- buttons can stop their hold-repeat. */
+                g_launcher_events.push_back(
+                    {LauncherEvent::Type::Release, dx - PANEL_X, dy - PANEL_Y, 0});
+                break;
+            }
+
             default:
                 break;
         }
@@ -923,6 +981,9 @@ void handle_event(const SDL_Event& e) {
         case SDL_WINDOWEVENT:
             if (e.window.event == SDL_WINDOWEVENT_RESIZED ||
                 e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                /* The cross keys are sized in device units to look square at
+                 * the current window aspect, so relayout them on every resize. */
+                layout_controls();
                 g_needs_redraw = true;
             }
             break;
@@ -934,30 +995,28 @@ void handle_event(const SDL_Event& e) {
              * key press is swallowed so it does not also act on the UI. The
              * matching KEYUP still arrives and harmlessly releases nothing. */
             if (host_wake_display()) break;
-            /* Scale selection. */
+            /* Scale selection (host-only, not remappable). */
             if (e.key.keysym.sym == SDLK_1) { apply_scale(1, true); break; }
             if (e.key.keysym.sym == SDLK_2) { apply_scale(2, true); break; }
             if (e.key.keysym.sym == SDLK_3) { apply_scale(3, true); break; }
-            /* Encoder: Q/E rotate counter-clockwise / clockwise. */
-            if (e.key.keysym.sym == SDLK_q) { host_input::state.rotate(-1); break; }
-            if (e.key.keysym.sym == SDLK_e) { host_input::state.rotate(+1); break; }
-            /* Window rotation: R turns the body 90 degrees clockwise, mirroring
-             * the on-screen square button in the top-left corner. */
-            if (e.key.keysym.sym == SDLK_r) { rotate_window(); break; }
-            /* Fullscreen toggle, mirroring the on-screen "FS" button. */
-            if (e.key.keysym.sym == SDLK_f || e.key.keysym.sym == SDLK_F11) {
-                toggle_fullscreen();
-                break;
-            }
+
+            /* Remappable actions, matched by physical key (scancode) so the
+             * bindings keep working under any keyboard layout. */
+            const int scan = e.key.keysym.scancode;
+            const auto act = host_settings::action_for_scancode(scan);
+            if (act == host_settings::Action::EncoderCCW) { host_input::state.rotate(-1); break; }
+            if (act == host_settings::Action::EncoderCW) { host_input::state.rotate(+1); break; }
+            if (act == host_settings::Action::RotateWindow) { rotate_window(); break; }
+            if (act == host_settings::Action::ToggleFullscreen) { toggle_fullscreen(); break; }
 
             host_input::Btn b;
-            if (key_to_button(e.key.keysym.sym, b)) set_button(b, true);
+            if (key_to_button(scan, b)) set_button(b, true);
             break;
         }
 
         case SDL_KEYUP: {
             host_input::Btn b;
-            if (key_to_button(e.key.keysym.sym, b)) set_button(b, false);
+            if (key_to_button(e.key.keysym.scancode, b)) set_button(b, false);
             break;
         }
 
@@ -1081,7 +1140,11 @@ void handle_event(const SDL_Event& e) {
             if (dy != 0.0) {
                 int mag = static_cast<int>(std::fabs(dy) + 0.5);
                 if (mag < 1) mag = 1;
-                host_input::state.rotate(dy > 0.0 ? mag : -mag);
+                const bool up = (dy > 0.0);
+                /* Default: wheel-up (scroll away) turns the encoder clockwise.
+                 * The direction is user-configurable in the setup window. */
+                const bool clockwise = host_settings::wheel_inverted() ? !up : up;
+                host_input::state.rotate(clockwise ? mag : -mag);
             }
             break;
         }
@@ -1338,6 +1401,10 @@ void inject_key_event(int sdl_keycode, bool down) {
     ev.key.state = down ? SDL_PRESSED : SDL_RELEASED;
     ev.key.repeat = 0;
     ev.key.keysym.sym = static_cast<SDL_Keycode>(sdl_keycode);
+    /* The firmware matches keys by physical scancode (see key_to_button /
+     * action_for_scancode), so the scancode must be filled in too: a synthetic
+     * event with scancode 0 maps to no button and is silently ignored. */
+    ev.key.keysym.scancode = SDL_GetScancodeFromKey(ev.key.keysym.sym);
     SDL_PushEvent(&ev);
 }
 
@@ -1383,6 +1450,65 @@ bool launcher_poll(LauncherEvent& out) {
     }
     out = g_launcher_events[g_launcher_read++];
     return true;
+}
+
+void begin_key_capture() {
+    g_capturing_key = true;
+    g_captured_have = false;
+    g_captured_scancode = 0;
+}
+
+void cancel_key_capture() { g_capturing_key = false; }
+
+bool poll_captured_scancode(int& scancode) {
+    if (!g_captured_have) return false;
+    scancode = g_captured_scancode;
+    g_captured_have = false;
+    g_capturing_key = false;
+    return true;
+}
+
+bool key_capture_active() { return g_capturing_key; }
+
+/* Names for the handful of non-printable keys the bindings are likely to use;
+ * everything else falls back to SDL_GetScancodeName(), which is itself
+ * layout-independent because it names the physical key by its US-layout
+ * position. The returned strings are static, so callers may hold them. */
+const char* scancode_name(int scancode) {
+    if (scancode == 0) return "(none)";
+    switch (scancode) {
+        case SDL_SCANCODE_UP: return "Up";
+        case SDL_SCANCODE_DOWN: return "Down";
+        case SDL_SCANCODE_LEFT: return "Left";
+        case SDL_SCANCODE_RIGHT: return "Right";
+        case SDL_SCANCODE_RETURN: return "Enter";
+        case SDL_SCANCODE_KP_ENTER: return "Keypad Enter";
+        case SDL_SCANCODE_ESCAPE: return "Esc";
+        case SDL_SCANCODE_SPACE: return "Space";
+        case SDL_SCANCODE_TAB: return "Tab";
+        case SDL_SCANCODE_BACKSPACE: return "Backspace";
+        case SDL_SCANCODE_LSHIFT: return "Left Shift";
+        case SDL_SCANCODE_RSHIFT: return "Right Shift";
+        case SDL_SCANCODE_LCTRL: return "Left Ctrl";
+        case SDL_SCANCODE_RCTRL: return "Right Ctrl";
+        case SDL_SCANCODE_LALT: return "Left Alt";
+        case SDL_SCANCODE_RALT: return "Right Alt";
+        case SDL_SCANCODE_F1: return "F1";
+        case SDL_SCANCODE_F2: return "F2";
+        case SDL_SCANCODE_F3: return "F3";
+        case SDL_SCANCODE_F4: return "F4";
+        case SDL_SCANCODE_F5: return "F5";
+        case SDL_SCANCODE_F6: return "F6";
+        case SDL_SCANCODE_F7: return "F7";
+        case SDL_SCANCODE_F8: return "F8";
+        case SDL_SCANCODE_F9: return "F9";
+        case SDL_SCANCODE_F10: return "F10";
+        case SDL_SCANCODE_F11: return "F11";
+        case SDL_SCANCODE_F12: return "F12";
+        default: break;
+    }
+    const char* name = SDL_GetScancodeName(static_cast<SDL_Scancode>(scancode));
+    return (name && *name) ? name : "(unknown)";
 }
 
 }  // namespace lcd_sdl

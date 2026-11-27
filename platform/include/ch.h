@@ -59,6 +59,22 @@ struct Semaphore {
     std::recursive_mutex impl;
 };
 
+/* Binary semaphore, as used by the FT8 decoder thread (chbsem.h upstream).
+ * `available` mirrors the ChibiOS counter: init with taken=true leaves it 0 so
+ * the first chBSemWait() blocks until the baseband thread signals a slot. */
+struct BinarySemaphore {
+    std::mutex impl;
+    std::condition_variable cv;
+    bool available{false};
+};
+
+/* Static thread working-area helpers, matching the ARM port's contract: only
+ * the array's address and size are passed to chThdCreateStatic, so on the host
+ * the storage is unused and a single byte suffices per strong requirement. */
+using stkalign_t = uint32_t;
+#define THD_WA_SIZE(n) ((size_t)(n))
+#define WORKING_AREA(s, n) stkalign_t s[(THD_WA_SIZE(n) + sizeof(stkalign_t) - 1) / sizeof(stkalign_t)]
+
 /* Per-thread state. The public fields mirror the ChibiOS ones used by the
  * firmware (notably p_u.rdymsg in ThreadWait). */
 struct Thread {
@@ -126,6 +142,12 @@ bool chSysIsLocked();
 /* Scheduler helpers used by ThreadWait. */
 void chSchGoSleepS(int state);
 void chSchReadyI(Thread* tp);
+
+/* Binary semaphore ops (see struct BinarySemaphore above). */
+void chBSemInit(BinarySemaphore* bsp, bool taken);
+void chBSemSignal(BinarySemaphore* bsp);
+void chBSemWait(BinarySemaphore* bsp);
+void chBSemReset(BinarySemaphore* bsp, bool taken);
 
 /* Heap used by the application. */
 void* chHeapAlloc(void* heap, size_t size);

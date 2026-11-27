@@ -30,6 +30,7 @@
 #include "host_battery.hpp"
 
 #include "battery.hpp"
+#include "host_settings.hpp"
 
 #include "event_m0.hpp"
 #include "message.hpp"
@@ -139,6 +140,7 @@ struct HostBattery {
     bool on_mains{false};   /* running from AC */
     uint8_t percent{100};
     uint16_t millivolts{0};
+    uint16_t capacity_mah{0}; /* full-charge capacity reported by the pack, 0 if unknown */
     bool on_charger{false}; /* charging (or on mains with no battery) */
 };
 
@@ -168,6 +170,32 @@ HostBattery sample() {
         if (read_sysfs(s.battery + "status", status)) {
             b.on_charger = (status == "Charging" || status == "Full");
         }
+
+        /* Full-charge capacity straight from the pack, so the battery screen
+         * shows the real mAh instead of the firmware's assumed default.
+         * Prefer the pack's *design* (rated) capacity: the *_full value is the
+         * worn full-charge capacity, which drops with age and looks like a
+         * "remaining" figure. Only fall back to it if no design value exists.
+         *   charge_* is in uAh -> /1000 = mAh
+         *   energy_* is in uWh, so divide by the design voltage (uV) to get Ah
+         *   and scale to mAh. */
+        auto read_capacity = [&](const char* charge_attr, const char* energy_attr) -> long {
+            long charge_uah = 0;
+            if (read_int_attr(s.battery + charge_attr, charge_uah) && charge_uah > 0)
+                return charge_uah / 1000;
+            long energy_uwh = 0;
+            if (read_int_attr(s.battery + energy_attr, energy_uwh) && energy_uwh > 0) {
+                long v_uv = 0;
+                if (!read_int_attr(s.battery + "voltage_min_design", v_uv) || v_uv <= 0)
+                    read_int_attr(s.battery + "voltage_now", v_uv);
+                if (v_uv > 0)
+                    return static_cast<long>(static_cast<long long>(energy_uwh) * 1000 / v_uv);
+            }
+            return 0;
+        };
+        long cap_mah = read_capacity("charge_full_design", "energy_full_design");
+        if (cap_mah <= 0) cap_mah = read_capacity("charge_full", "energy_full");
+        if (cap_mah > 0) b.capacity_mah = static_cast<uint16_t>(cap_mah);
     }
 
     /* While the machine is on mains power, report a full pack: the operator asked
@@ -240,6 +268,15 @@ float BatteryManagement::get_tte() {
 
 float BatteryManagement::get_ttf() {
     return 0.0f;
+}
+
+uint16_t BatteryManagement::get_capacity_mah() {
+    /* A value typed on the launcher's Battery line overrides everything. */
+    const int override_mah = host_settings::battery_mah();
+    if (override_mah > 0) return static_cast<uint16_t>(override_mah);
+    /* Otherwise use the host's own pack full-charge capacity, so the battery
+     * screen can show the real mAh instead of the firmware default. */
+    return sample().capacity_mah;
 }
 
 }  // namespace battery

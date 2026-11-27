@@ -44,12 +44,18 @@
 #include "host_lcd.hpp"
 #include "host_launcher.hpp"
 #include "host_baseband.hpp"
+#include "host_settings.hpp"
 #include "sdr_device.hpp"
 
 /* The Replay app's view, pulled in only for the MAYHEM_AUTOPLAY_PPL diagnostic
  * hook below (it opens the app straight on a playlist so the transmit handshake
  * can be exercised without the touch UI). */
 #include "ui_playlist.hpp"
+
+/* The Remote app's view, pulled in only for the MAYHEM_OPEN_REMOTE diagnostic
+ * hook below (it opens the app so its dead waterfall band can be reproduced
+ * without driving the touch UI). */
+#include "external/remote/ui_remote.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -139,6 +145,15 @@ msg_t ui_thread(void*) {
         }
     }
 
+    /* Diagnostic hook (MAYHEM_OPEN_REMOTE=1): open the Remote app straight away
+     * so its waterfall band can be exercised without driving the touch UI.
+     * Env-gated, never enabled by default. */
+    if (const char* r = std::getenv("MAYHEM_OPEN_REMOTE")) {
+        if (r[0] != '\0') {
+            system_view.get_navigation_view()->push<ui::external_app::remote::RemoteAppView>();
+        }
+    }
+
     event_dispatcher.run();
     return 0;
 }
@@ -197,8 +212,13 @@ int main(int argc, char** argv) {
         lcd_sdl::set_deck_visible(!choice.touch_only);
         lcd_sdl::set_rotation(choice.rotation);
     } else {
-        /* No setup window this run: honour the rotation saved by the last one. */
-        lcd_sdl::set_rotation(host_launcher::saved_rotation());
+        /* No setup window this run: honour the settings saved by the last one
+         * (rotation, input mode and key bindings). host_launcher::run() loads
+         * the file when the setup window is shown; do it here for the direct
+         * boot, and apply the deck/rotation choices the launcher would have. */
+        host_settings::load();
+        lcd_sdl::set_deck_visible(!host_settings::touch_only());
+        lcd_sdl::set_rotation(host_settings::rotation());
     }
 
     /* Install the chosen folder: the FatFs shim and the persistent-memory
@@ -216,6 +236,15 @@ int main(int argc, char** argv) {
     }
 
     Theme::SetTheme(static_cast<Theme::ThemeId>(portapack::persistent_memory::ui_theme_id()));
+
+    /* Battery capacity typed in the setup window (0 = auto, read from the
+     * device). Push it into the firmware's setting so the battery screen and
+     * the charge estimate use it. */
+    {
+        const int batt_mah = host_settings::battery_mah();
+        if (batt_mah > 0)
+            portapack::persistent_memory::set_battery_cap_mah(static_cast<uint16_t>(batt_mah));
+    }
 
     /* Second heartbeat (see rtc_tick_thread) and the UI thread itself. The frame
      * sync and controls init happen inside ui_thread, where chThdSelf() is
