@@ -2,7 +2,7 @@
 
 **English** | [Русский](README.ru.md)
 
-> **ALPHA** — early, work-in-progress port. Expect rough edges and unfinished
+> **BETA** — early, work-in-progress port. Expect rough edges and unfinished
 > features.
 
 A desktop port of the **PortaPack Mayhem** firmware (HackRF One + PortaPack H2)
